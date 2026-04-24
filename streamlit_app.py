@@ -214,3 +214,4 @@ with l_col:
 if st.button("📥 執行今日結算"):
     st.session_state.daily_history.append({"date": datetime.now().strftime('%m/%d'), "equity": current_equity})
     st.success("今日淨值已記錄")
+
