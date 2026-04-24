@@ -11,25 +11,21 @@ import plotly.graph_objects as go
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
 # ==========================================
-# 1. 頁面配置與專業 UI 樣式 (完美保留你的設計)
+# 1. 頁面配置與專業 UI 樣式
 # ==========================================
 st.set_page_config(page_title="STP 操盤模擬平台 | Royal Life", layout="wide", initial_sidebar_state="collapsed")
 
 st.markdown("""
 <style>
-    /* 隱藏預設元件 */
     #MainMenu {visibility: hidden;}
     footer {visibility: hidden;}
     
-    /* 數據卡片美化 */
     div[data-testid="metric-container"] {
         background-color: #1e1e1e; border: 1px solid #333; padding: 15px; border-radius: 10px; border-left: 5px solid #ffb703;
     }
     
-    /* 強化輸入框顯示 (防止 iOS Safari 縮放) */
     .stTextInput input, .stNumberInput input, .stTextArea textarea { font-size: 16px !important; }
 
-    /* 金黃色浮動說明按鈕 */
     .help-float-btn {
         position: fixed; bottom: 30px; right: 30px; background-color: #ffb703; color: #000; width: 60px; height: 60px;
         border-radius: 50%; box-shadow: 0 4px 15px rgba(255, 183, 3, 0.6); font-size: 1rem; font-weight: 900;
@@ -38,22 +34,20 @@ st.markdown("""
     }
     .help-float-btn:hover { transform: scale(1.1); background-color: #ff9f1c; }
     
-    /* 圖表容器高度限制 */
     .chart-container-box { height: 280px; overflow: hidden; margin-bottom: 20px; }
 </style>
 """, unsafe_allow_html=True)
 
 # ==========================================
-# 2. 系統常數與狀態初始化 (依據 STP 提案書 1.3)
+# 2. 系統常數與狀態初始化
 # ==========================================
-INITIAL_CAPITAL = 200000000       # 初始資金 2 億
-COST_LIMIT_PER_TICKER = 40000000  # 單一標的成本上限 4,000 萬
-MIN_PORTFOLIO_COST = 20000000     # 持股最低水位 2,000 萬
-FEE_RATE = 0.0004                 # 法人手續費 0.04%
-TOTAL_LOSS_LIMIT = 20000000       # 總累積虧損上限 2,000 萬
-PHASE_LOSS_LIMIT = 10000000       # 階段性虧損上限 1,000 萬
+INITIAL_CAPITAL = 200000000       
+COST_LIMIT_PER_TICKER = 40000000  
+MIN_PORTFOLIO_COST = 20000000     
+FEE_RATE = 0.0004                 
+TOTAL_LOSS_LIMIT = 20000000       
+PHASE_LOSS_LIMIT = 10000000       
 
-# 初始化 Session State
 if 'group' not in st.session_state: st.session_state.group = "股票投資組"
 if 'cash' not in st.session_state: st.session_state.cash = INITIAL_CAPITAL
 if 'realized_pnl' not in st.session_state: st.session_state.realized_pnl = 0
@@ -70,7 +64,6 @@ def fetch_market_data():
     market_info = {}
     headers = {'User-Agent': 'Mozilla/5.0'}
     try:
-        # 使用 verify=False 解決 SSL 憑證驗證失敗問題
         twse_url = "https://openapi.twse.com.tw/v1/exchangeReport/STOCK_DAY_ALL"
         twse_resp = requests.get(twse_url, headers=headers, timeout=10, verify=False)
         if twse_resp.status_code == 200:
@@ -98,16 +91,16 @@ def get_equity():
 @st.dialog("📈 STP 模擬交易標準流程與風控")
 def show_help_dialog():
     st.markdown(f"""
-    #### 1. [span_0](start_span)買進與持股限制[span_0](end_span)
+    #### 1. 買進與持股限制
     * 單一標的總成本上限：**4,000 萬元**。
     * 持股最低成本限制：**2,000 萬元**。
     
-    #### 2. [span_1](start_span)成交價計價規則[span_1](end_span)
+    #### 2. 成交價計價規則
     * **13:30 前**下單：以**當日收盤價**計算。
     * **13:30 後**下單：以**次日收盤價**計算。
     
-    #### 3. [span_2](start_span)階段性停損規範[span_2](end_span)
-    * 總累積虧損達 2,000 萬，或階段性虧損達 1,000 萬，強制停止交易。
+    #### 3. 階段性停損規範
+    * 總累積虧損達兩千萬，或階段性虧損達一千萬，強制停止交易。
     * 單一標的損失達 **30%**，須於次日強制出清。
     """)
 
@@ -154,10 +147,10 @@ total_cost = sum(p['avg_cost'] * p['quantity'] for p in st.session_state.positio
 now = datetime.now()
 is_halted = False
 if total_pnl <= -TOTAL_LOSS_LIMIT:
-    [span_3](start_span)st.error("🚨 警告：總累積虧損已達 2,000 萬上限，強制停止交易！[span_3](end_span)")
+    st.error("🚨 警告：總虧損已達兩千萬上限，依規定強制停止交易！")
     is_halted = True
 elif (datetime(2026, 6, 22) <= now <= datetime(2026, 7, 31)) and total_pnl <= -PHASE_LOSS_LIMIT:
-    [span_4](start_span)st.warning("🚨 警告：階段性虧損已達 1,000 萬，依規定須停止交易！[span_4](end_span)")
+    st.warning("🚨 警告：階段虧損已達一千萬，系統鎖定並暫停交易！")
     is_halted = True
 
 m1, m2, m3, m4 = st.columns(4)
@@ -167,7 +160,7 @@ m3.metric("總損益 (PnL)", f"${total_pnl:,.0f}", delta=f"{total_pnl:,.0f}")
 m4.metric("當前持股成本", f"${total_cost:,.0f}")
 
 if 0 < total_cost < MIN_PORTFOLIO_COST:
-    [span_5](start_span)st.warning(f"⚠️ 提醒：持股總成本目前低於規範之 2,000 萬水位。[span_5](end_span)")
+    st.warning("⚠️ 提醒：持股總成本目前低於規範之兩千萬水位。")
 
 st.markdown("---")
 
@@ -203,7 +196,7 @@ with c2:
 st.markdown("---")
 
 # ==========================================
-# 7. 交易執行 (整合名稱、理由、13:30 計價)
+# 7. 交易執行
 # ==========================================
 t_col, l_col = st.columns([1, 2])
 
@@ -222,22 +215,21 @@ with t_col:
             
             st.caption(f"🔍 標的: {s_name} | 收盤參考價: {ref_price}")
             
-            price = st.number_input("成交單價 (依 13:30 規則計算)", min_value=0.0, value=float(ref_price), step=0.01)
+            price = st.number_input("成交單價", min_value=0.0, value=float(ref_price), step=0.01)
             qty = st.number_input("成交數量 (股)", min_value=1, step=1000, value=1000)
-            [span_6](start_span)reason = st.text_area("買進/賣出理由 (必填)[span_6](end_span)")
+            reason = st.text_area("買進/賣出理由 (必填)")
             
             b1, b2 = st.columns(2)
             buy_btn = b1.form_submit_button("🟩 買進", use_container_width=True)
             sell_btn = b2.form_submit_button("🟥 賣出", use_container_width=True)
 
             if buy_btn or sell_btn:
-                # 組別與標的限制判斷
                 group_valid = (st.session_state.group == "ETF投資組" and is_etf) or \
                               (st.session_state.group == "股票投資組" and not is_etf)
 
                 if not ticker or price <= 0: st.error("請確認代號與單價")
-                [span_7](start_span)elif not reason: st.error("❌ 依規範必須填寫交易理由！[span_7](end_span)")
-                [span_8](start_span)elif not group_valid: st.error(f"❌ 標的不符組別規範！[span_8](end_span)")
+                elif not reason: st.error("❌ 依規範必須填寫交易理由！")
+                elif not group_valid: st.error(f"❌ 標的不符組別規範！")
                 else:
                     exec_rule = "今日收盤價" if datetime.now().time() <= time(13, 30) else "次日收盤價"
                     
@@ -252,7 +244,7 @@ with t_col:
                         cur_t_cost = st.session_state.positions.get(ticker, {}).get('avg_cost', 0) * st.session_state.positions.get(ticker, {}).get('quantity', 0)
                         
                         if (cur_t_cost + net_cost) > COST_LIMIT_PER_TICKER:
-                            [span_9](start_span)st.error(f"❌ 違反單一標的 4,000 萬限額！[span_9](end_span)")
+                            st.error(f"❌ 違反單一標的四千萬限額！")
                         elif net_cost > st.session_state.cash:
                             st.error("❌ 現金不足")
                         else:
@@ -298,7 +290,7 @@ with l_col:
                 })
             st.dataframe(pd.DataFrame(disp_p), use_container_width=True, hide_index=True)
             if any("停損" in str(x) for x in disp_p):
-                [span_10](start_span)st.error("🚨 注意：已有標的損失達 30% 成本，依規須於次日強制出清！[span_10](end_span)")
+                st.error("🚨 注意：已有標的損失達 30% 成本，依規須於次日出清！")
                 
     with tab2:
         if st.session_state.trades:
