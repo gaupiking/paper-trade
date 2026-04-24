@@ -2,267 +2,279 @@ import streamlit as st
 import pandas as pd
 import requests
 import json
-from datetime import datetime
+import numpy as np
+from datetime import datetime, time
 import plotly.express as px
 
 # ==========================================
-# 1. 頁面配置與專業 UI 樣式
+# 1. [span_0](start_span)系統配置與 STP 規範常數[span_0](end_span)
 # ==========================================
-st.set_page_config(page_title="STP 操盤模擬平台 | Royal Life", layout="wide", initial_sidebar_state="collapsed")
+st.set_page_config(page_title="STP 法人級模擬交易平台", layout="wide")
 
+[span_1](start_span)INITIAL_CAPITAL = 200_000_000        # 初始資金 2 億[span_1](end_span)
+[span_2](start_span)COST_LIMIT_PER_TICKER = 40_000_000   # 單一標的成本上限 4,000 萬[span_2](end_span)
+[span_3](start_span)MIN_PORTFOLIO_COST = 20_000_000      # 每組持股最低成本限制 2,000 萬[span_3](end_span)
+[span_4](start_span)FEE_RATE = 0.0004                    # 法人單手續費率 0.04%[span_4](end_span)
+[span_5](start_span)TOTAL_LOSS_LIMIT = 20_000_000        # 總累積虧損上限 2,000 萬[span_5](end_span)
+[span_6](start_span)PHASE_LOSS_LIMIT = 10_000_000        # 階段性虧損上限 1,000 萬[span_6](end_span)
+
+# CSS 樣式
 st.markdown("""
 <style>
-    #MainMenu {visibility: hidden;}
-    footer {visibility: hidden;}
-    
-    /* 數據卡片美化 */
-    div[data-testid="metric-container"] {
-        background-color: #1e1e1e; border: 1px solid #333; padding: 15px; border-radius: 10px; border-left: 5px solid #ffb703;
-    }
-    
-    /* 輸入框強化 */
-    .stTextInput input, .stNumberInput input { font-size: 16px !important; }
-
-    /* 金黃色浮動說明按鈕 */
-    .help-float-btn {
-        position: fixed; bottom: 30px; right: 30px; background-color: #ffb703; color: #000; width: 60px; height: 60px;
-        border-radius: 50%; box-shadow: 0 4px 15px rgba(255, 183, 3, 0.6); font-size: 1rem; font-weight: 900;
-        z-index: 9999; display: flex; justify-content: center; align-items: center; border: 3px solid #fff;
-        cursor: pointer; text-decoration: none; transition: transform 0.2s ease;
-    }
+    .metric-card { background-color: #1e1e1e; border: 1px solid #333; padding: 15px; border-radius: 10px; }
+    .stButton>button { width: 100%; }
+    .risk-warning { color: #ff4b4b; font-weight: bold; border: 1px solid #ff4b4b; padding: 10px; border-radius: 5px; }
 </style>
 """, unsafe_allow_html=True)
 
 # ==========================================
-# 2. 系統常數與狀態初始化
+# 2. 初始化 Session State
 # ==========================================
-INITIAL_CAPITAL = 200000000       # 初始資金 2 億
-COST_LIMIT_PER_TICKER = 40000000  # 單一標的成本上限 4,000 萬
-FEE_RATE = 0.0004                 # 法人單手續費率 0.04%
-
-# 初始化 Session State
-state_keys = {
-    'cash': INITIAL_CAPITAL,
-    'realized_pnl': 0,
-    'trades': [],
-    'positions': {},
-    'daily_equity_history': [],
-    'market_prices': {}  # 格式: { '代號': {'name': '名稱', 'price': 0.0} }
-}
-for key, value in state_keys.items():
-    if key not in st.session_state:
-        st.session_state[key] = value
+if 'initialized' not in st.session_state:
+    [span_7](start_span)st.session_state.group = "股票投資組"  # 預設組別[span_7](end_span)
+    st.session_state.cash = INITIAL_CAPITAL
+    st.session_state.realized_pnl = 0
+    st.session_state.trades = []
+    st.session_state.positions = {}
+    st.session_state.daily_history = []  # 紀錄每日淨值
+    st.session_state.market_prices = {}
+    [span_8](start_span)st.session_state.trading_halted = False # 是否因風控停止交易[span_8](end_span)
+    st.session_state.initialized = True
 
 # ==========================================
-# 3. 核心數據抓取與清洗 (解決報價抓不到的問題)
+# 3. 核心功能函式
 # ==========================================
+
 @st.cache_data(ttl=3600)
-def fetch_market_data():
+def fetch_twse_data():
+    """抓取並清洗市場報價數據"""
     market_info = {}
     headers = {'User-Agent': 'Mozilla/5.0'}
-    
-    # 抓取上市 (TWSE)
     try:
-        twse_url = "https://openapi.twse.com.tw/v1/exchangeReport/STOCK_DAY_ALL"
-        twse_data = requests.get(twse_url, headers=headers, timeout=10).json()
-        for i in twse_data:
-            # 清洗價格：移除逗號並處理 "-", "" 等異常值
+        # 上市資料
+        twse = requests.get("https://openapi.twse.com.tw/v1/exchangeReport/STOCK_DAY_ALL", timeout=10).json()
+        for i in twse:
             raw_p = str(i.get('ClosingPrice', '0')).replace(',', '')
             price = float(raw_p) if raw_p and raw_p not in ['-', ''] else 0.0
-            market_info[i['Code']] = {'name': i['Name'], 'price': price}
-    except Exception as e:
-        st.warning(f"上市報價抓取失敗: {e}")
-
-    # 抓取上櫃 (TPEx)
-    try:
-        tpex_url = "https://www.tpex.org.tw/openapi/v1/tpex_mainboard_quotes"
-        tpex_data = requests.get(tpex_url, headers=headers, timeout=10).json()
-        for i in tpex_data:
+            market_info[i['Code']] = {'name': i['Name'], 'price': price, 'is_etf': i['Code'].startswith('00')}
+        
+        # 上櫃資料
+        tpex = requests.get("https://www.tpex.org.tw/openapi/v1/tpex_mainboard_quotes", timeout=10).json()
+        for i in tpex:
             raw_p = str(i.get('Close', '0')).replace(',', '')
             price = float(raw_p) if raw_p and raw_p not in ['-', ''] else 0.0
-            market_info[i['SecuritiesCompanyCode']] = {'name': i['CompanyName'], 'price': price}
-    except Exception as e:
-        st.warning(f"上櫃報價抓取失敗: {e}")
-
+            market_info[i['SecuritiesCompanyCode']] = {'name': i['CompanyName'], 'price': price, 'is_etf': i['SecuritiesCompanyCode'].startswith('00')}
+    except:
+        pass
     return market_info
 
-def get_equity():
-    """計算當前總淨值 (現金 + 庫存市值)"""
-    stock_val = 0
-    for t, p in st.session_state.positions.items():
-        # 取得最新市價，若抓不到則暫以均價計算
-        cur_p = st.session_state.market_prices.get(t, {}).get('price', p['avg_cost'])
-        stock_val += cur_p * p['quantity']
-    return st.session_state.cash + stock_val
+def calculate_metrics():
+    [span_9](start_span)"""計算 Sharpe Ratio 與 MDD[span_9](end_span)"""
+    if not st.session_state.daily_history:
+        return 0, 0
+    df = pd.DataFrame(st.session_state.daily_history)
+    returns = df['equity'].pct_change().dropna()
+    sharpe = (returns.mean() / returns.std() * np.sqrt(252)) if len(returns) > 1 and returns.std() != 0 else 0
+    
+    # MDD
+    rolling_max = df['equity'].cummax()
+    drawdown = (df['equity'] - rolling_max) / rolling_max
+    mdd = drawdown.min()
+    return sharpe, mdd
 
 # ==========================================
-# 4. 側邊欄與存檔管理
+# 4. UI 佈局：側邊欄 (組別與權限控制)
 # ==========================================
 with st.sidebar:
-    st.header("⚙️ 系統進度管理")
-    if st.button("🔄 更新全市場收盤價", use_container_width=True):
-        new_prices = fetch_market_data()
-        if new_prices:
-            st.session_state.market_prices = new_prices
-            st.success(f"已同步 {len(new_prices)} 檔標的")
-            st.rerun()
+    st.title("🛡️ STP 系統管理")
+    
+    # [span_10](start_span)組別切換[span_10](end_span)
+    new_group = st.radio("當前操作組別：", ["股票投資組", "ETF投資組"])
+    if new_group != st.session_state.group:
+        st.session_state.group = new_group
+        st.rerun()
     
     st.divider()
-    up_file = st.file_uploader("📂 載入進度 (.json)", type="json")
-    if up_file:
-        data = json.load(up_file)
-        st.session_state.update(data)
-        st.success("讀檔成功")
+    if st.button("🔄 同步全市場收盤價"):
+        st.session_state.market_prices = fetch_twse_data()
+        st.success("報價已更新")
     
-    # 存檔需排除大型報價字典以縮減體積
-    save_data = {k: v for k, v in st.session_state.items() if k != 'market_prices'}
-    st.download_button("💾 儲存進度檔 (JSON)", 
-        data=json.dumps(save_data, ensure_ascii=False),
-        file_name=f"STP_Save_{datetime.now().strftime('%m%d')}.json", use_container_width=True)
+    # [span_11](start_span)數據導出功能[span_11](end_span)
+    st.subheader("📥 數據導出 (期末量化分析用)")
+    if st.session_state.trades:
+        trade_df = pd.DataFrame(st.session_state.trades)
+        st.download_button("匯出交易日報表 (CSV)", trade_df.to_csv(index=False).encode('utf-8-sig'), "trade_report.csv")
+    
+    if st.session_state.daily_history:
+        perf_df = pd.DataFrame(st.session_state.daily_history)
+        st.download_button("匯出每日績效總表 (CSV)", perf_df.to_csv(index=False).encode('utf-8-sig'), "perf_report.csv")
 
 # ==========================================
-# 5. 儀表板數據呈現
+# 5. [span_12](start_span)儀表板與風控狀態偵測[span_12](end_span)
 # ==========================================
-st.title("📈 STP 操盤手模擬訓練平台")
+st.title(f"📈 STP 模擬交易平台 - {st.session_state.group}")
 
-eq = get_equity()
-unrealized = sum(((st.session_state.market_prices.get(t, {}).get('price', p['avg_cost']) - p['avg_cost']) * p['quantity']) 
-                 for t, p in st.session_state.positions.items())
-total_pnl = unrealized + st.session_state.realized_pnl
+# 計算當前狀態
+current_equity = st.session_state.cash + sum(
+    st.session_state.market_prices.get(t, {}).get('price', p['avg_cost']) * p['quantity'] 
+    for t, p in st.session_state.positions.items()
+)
+total_unrealized = sum(
+    (st.session_state.market_prices.get(t, {}).get('price', p['avg_cost']) - p['avg_cost']) * p['quantity']
+    for t, p in st.session_state.positions.items()
+)
+total_pnl = st.session_state.realized_pnl + total_unrealized
+total_cost = sum(p['avg_cost'] * p['quantity'] for p in st.session_state.positions.values())
 
+# [span_13](start_span)風控檢查邏輯[span_13](end_span)
+now = datetime.now()
+is_phase_1 = (datetime(2026, 6, 22) <= now <= datetime(2026, 6, 30))
+is_phase_2 = (datetime(2026, 7, 1) <= now <= datetime(2026, 7, 31))
+
+if total_pnl <= -TOTAL_LOSS_LIMIT:
+    st.error("🚨 警告：總虧損已達 2,000 萬，依規定強制停止交易！")
+    st.session_state.trading_halted = True
+elif (is_phase_1 or is_phase_2) and total_pnl <= -PHASE_LOSS_LIMIT:
+    st.error("🚨 警告：本階段虧損已達 1,000 萬，依規定須全數平倉並暫停交易！")
+    st.session_state.trading_halted = True
+
+# 顯示關鍵數據
 m1, m2, m3, m4 = st.columns(4)
-m1.metric("帳戶總淨值 (NAV)", f"${eq:,.0f}")
-m2.metric("可用現金", f"${st.session_state.cash:,.0f}")
-m3.metric("總損益 (Total PnL)", f"${total_pnl:,.0f}", delta=f"{total_pnl:,.0f}")
-m4.metric("已實現損益", f"${st.session_state.realized_pnl:,.0f}")
+m1.metric("帳戶總淨值", f"${current_equity:,.0f}")
+m2.metric("總損益 (PnL)", f"${total_pnl:,.0f}", delta=f"{total_pnl:,.0f}")
+m3.metric("當前持股總成本", f"${total_cost:,.0f}")
+m4.metric("可用現金", f"${st.session_state.cash:,.0f}")
 
-st.divider()
-
-# ==========================================
-# 6. 圖表分析區
-# ==========================================
-c1, c2 = st.columns([1, 2])
-with c1:
-    st.subheader("資產配置")
-    val_map = {"現金": st.session_state.cash, "股票": 0, "一般型 ETF": 0, "債券型 ETF": 0}
-    for t, p in st.session_state.positions.items():
-        cur_p = st.session_state.market_prices.get(t, {}).get('price', p['avg_cost'])
-        val_map[p['type']] += (cur_p * p['quantity'])
-    
-    fig = px.pie(names=list(val_map.keys()), values=list(val_map.values()), hole=0.5, 
-                 color_discrete_sequence=['#4a4e69', '#ef476f', '#06d6a0', '#118ab2'])
-    fig.update_layout(height=300, margin=dict(t=20, b=20, l=0, r=0))
-    st.plotly_chart(fig, use_container_width=True)
-
-with c2:
-    st.subheader("淨值走勢與結算")
-    if st.button("📥 結算今日淨值紀錄", use_container_width=True):
-        today = datetime.now().strftime('%m/%d')
-        st.session_state.daily_equity_history = [h for h in st.session_state.daily_equity_history if h['date'] != today]
-        st.session_state.daily_equity_history.append({"date": today, "equity": eq})
-        st.success(f"今日 ({today}) 淨值已存檔")
-
-    if st.session_state.daily_equity_history:
-        h_df = pd.DataFrame(st.session_state.daily_equity_history)
-        fig_l = px.line(h_df, x='date', y='equity', markers=True, template="plotly_dark")
-        fig_l.update_layout(height=250, margin=dict(t=10, b=10, l=10, r=10))
-        st.plotly_chart(fig_l, use_container_width=True)
+# [span_14](start_span)風控提示：最低持股成本限制[span_14](end_span)
+if total_cost < MIN_PORTFOLIO_COST and total_cost > 0:
+    st.warning(f"⚠️ 風控提醒：當前持股成本 ${total_cost:,.0f} 低於規範之 2,000 萬水位！")
 
 # ==========================================
-# 7. 交易執行模組 (含自動名稱偵測)
+# 6. 交易執行模組 (含 13:30 撮合與權限控制)
 # ==========================================
 st.divider()
 t_col, l_col = st.columns([1, 2])
 
 with t_col:
-    st.subheader("執行交易")
-    with st.form("trade_form", clear_on_submit=True):
-        ticker = st.text_input("輸入標的代號").strip().upper()
-        
-        # 動態顯示標的資訊
-        stock_info = st.session_state.market_prices.get(ticker, {})
-        s_name = stock_info.get('name', "請輸入代號")
-        m_price = stock_info.get('price', 0.0)
-        st.caption(f"🔍 標的：{s_name} | 收盤參考：{m_price}")
-        
-        price = st.number_input("成交單價", min_value=0.0, value=float(m_price), step=0.01)
-        qty = st.number_input("成交數量 (股)", min_value=1, step=1000, value=1000)
-        note = st.text_input("交易筆記")
-        
-        b1, b2 = st.columns(2)
-        buy_btn = b1.form_submit_button("🟩 買進", use_container_width=True)
-        sell_btn = b2.form_submit_button("🟥 賣出", use_container_width=True)
-
-        if buy_btn or sell_btn:
-            if not ticker or price <= 0:
-                st.error("請確認代號與單價是否正確")
-            else:
-                # 判定資產類型與稅率
-                if ticker.startswith('00'):
-                    a_type, t_rate = ('債券型 ETF', 0.0) if ticker.endswith('B') else ('一般型 ETF', 0.001)
+    st.subheader("📢 交易委託單")
+    if st.session_state.trading_halted:
+        st.error("交易權限已被鎖定 (風控因素)")
+    else:
+        with st.form("trade_form", clear_on_submit=True):
+            ticker = st.text_input("標的代號").strip().upper()
+            
+            # 動態獲取資訊
+            info = st.session_state.market_prices.get(ticker, {})
+            name = info.get('name', "未知標的")
+            is_etf = info.get('is_etf', False)
+            ref_price = info.get('price', 0.0)
+            
+            st.caption(f"🔍 名稱: {name} | 市價: {ref_price}")
+            
+            price = st.number_input("成交單價 (依 13:30 規則計算)", value=float(ref_price), step=0.01)
+            qty = st.number_input("數量 (股)", min_value=1, step=1000)
+            [span_15](start_span)reason = st.text_area("買進/賣出理由 (必填)[span_15](end_span)", placeholder="請輸入研究觀點...")
+            
+            b1, b2 = st.columns(2)
+            buy = b1.form_submit_button("🟩 買進")
+            sell = b2.form_submit_button("🟥 賣出")
+            
+            if buy or sell:
+                # 1. [span_16](start_span)權限檢查[span_16](end_span)
+                group_valid = (st.session_state.group == "ETF投資組" and is_etf) or \
+                              (st.session_state.group == "股票投資組" and not is_etf)
+                
+                if not reason:
+                    st.error("請輸入交易理由")
+                elif ticker not in st.session_state.market_prices:
+                    st.error("查無此標的代號")
+                elif not group_valid:
+                    st.error(f"❌ 違規：{st.session_state.group} 不得操作 {'股票' if is_etf else 'ETF'}！")
                 else:
-                    a_type, t_rate = '股票', 0.003
-                
-                base_val = price * qty
-                fee = max(20, int(base_val * FEE_RATE))
-                
-                if buy_btn:
-                    net_cost = base_val + fee
-                    current_pos_val = st.session_state.positions.get(ticker, {}).get('avg_cost', 0) * st.session_state.positions.get(ticker, {}).get('quantity', 0)
+                    # 2. [span_17](start_span)13:30 撮合邏輯判斷[span_17](end_span)
+                    current_time = datetime.now().time()
+                    trade_date = datetime.now().strftime("%Y-%m-%d")
+                    if current_time > time(13, 30):
+                        st.info("💡 13:30 後下單，將以下一個交易日收盤價計價。")
+                        exec_note = "次日結算"
+                    else:
+                        exec_note = "今日結算"
+                        
+                    # 3. [span_18](start_span)計算稅費[span_18](end_span)
+                    base = price * qty
+                    fee = max(20, int(base * FEE_RATE))
                     
-                    if (current_pos_val + net_cost) > COST_LIMIT_PER_TICKER:
-                        st.error(f"❌ 違反風控：單一標的總成本上限為 4,000 萬！")
-                    elif net_cost > st.session_state.cash:
-                        st.error("❌ 現金不足")
-                    else:
-                        st.session_state.cash -= net_cost
-                        pos = st.session_state.positions.get(ticker, {'quantity': 0, 'avg_cost': 0, 'type': a_type})
-                        new_qty = pos['quantity'] + qty
-                        pos['avg_cost'] = ((pos['avg_cost'] * pos['quantity']) + net_cost) / new_qty
-                        pos['quantity'] = new_qty
-                        st.session_state.positions[ticker] = pos
-                        st.session_state.trades.append({
-                            "時間": datetime.now().strftime("%H:%M"), "動作": "買進", 
-                            "代號": ticker, "名稱": s_name, "價格": price, "數量": qty, "損益影響": -net_cost, "備註": note
-                        })
-                        st.rerun()
+                    if buy:
+                        net_cost = base + fee
+                        existing_cost = st.session_state.positions.get(ticker, {}).get('avg_cost', 0) * st.session_state.positions.get(ticker, {}).get('quantity', 0)
+                        
+                        if (existing_cost + net_cost) > COST_LIMIT_PER_TICKER:
+                            st.error("❌ 違反風控：單一標的成本上限 4,000 萬！")
+                        elif net_cost > st.session_state.cash:
+                            st.error("❌ 資金不足")
+                        else:
+                            st.session_state.cash -= net_cost
+                            pos = st.session_state.positions.get(ticker, {'quantity': 0, 'avg_cost': 0, 'type': 'ETF' if is_etf else '股票'})
+                            new_q = pos['quantity'] + qty
+                            pos['avg_cost'] = ((pos['avg_cost'] * pos['quantity']) + net_cost) / new_q
+                            pos['quantity'] = new_q
+                            st.session_state.positions[ticker] = pos
+                            st.session_state.trades.append({"日期": trade_date, "動作": "買進", "代號": ticker, "名稱": name, "價格": price, "數量": qty, "理由": reason, "計價": exec_note})
+                            st.rerun()
 
-                if sell_btn:
-                    if ticker not in st.session_state.positions or st.session_state.positions[ticker]['quantity'] < qty:
-                        st.error("❌ 庫存不足")
-                    else:
-                        tax = int(base_val * t_rate)
-                        net_recv = base_val - fee - tax
-                        cost_basis = st.session_state.positions[ticker]['avg_cost'] * qty
-                        st.session_state.cash += net_recv
-                        st.session_state.realized_pnl += (net_recv - cost_basis)
-                        st.session_state.positions[ticker]['quantity'] -= qty
-                        if st.session_state.positions[ticker]['quantity'] == 0:
-                            del st.session_state.positions[ticker]
-                        st.session_state.trades.append({
-                            "時間": datetime.now().strftime("%H:%M"), "動作": "賣出", 
-                            "代號": ticker, "名稱": s_name, "價格": price, "數量": qty, "損益影響": net_recv, "備註": note
-                        })
-                        st.rerun()
+                    if sell:
+                        if ticker not in st.session_state.positions or st.session_state.positions[ticker]['quantity'] < qty:
+                            st.error("❌ 庫存不足")
+                        else:
+                            # [span_19](start_span)稅率判定[span_19](end_span)
+                            if not is_etf: tax_rate = 0.003
+                            elif ticker.endswith('B'): tax_rate = 0.0
+                            else: tax_rate = 0.001
+                            
+                            tax = int(base * tax_rate)
+                            net_recv = base - fee - tax
+                            st.session_state.cash += net_recv
+                            st.session_state.realized_pnl += (net_recv - (st.session_state.positions[ticker]['avg_cost'] * qty))
+                            st.session_state.positions[ticker]['quantity'] -= qty
+                            if st.session_state.positions[ticker]['quantity'] == 0: del st.session_state.positions[ticker]
+                            st.session_state.trades.append({"日期": trade_date, "動作": "賣出", "代號": ticker, "名稱": name, "價格": price, "數量": qty, "理由": reason, "計價": exec_note})
+                            st.rerun()
 
+# ==========================================
+# 7. [span_20](start_span)庫存管理與 30% 強制停損警示[span_20](end_span)
+# ==========================================
 with l_col:
-    tab1, tab2 = st.tabs(["📊 當前庫存", "📝 歷史明細"])
+    tab1, tab2 = st.tabs(["📊 當前庫存部位", "📝 交易日誌紀錄"])
     with tab1:
         if st.session_state.positions:
-            disp_p = []
+            pos_data = []
             for t, p in st.session_state.positions.items():
                 cur_p = st.session_state.market_prices.get(t, {}).get('price', p['avg_cost'])
+                ratio = (cur_p / p['avg_cost']) - 1
                 un_pnl = (cur_p - p['avg_cost']) * p['quantity']
-                disp_p.append({
-                    "標的": t, "名稱": st.session_state.market_prices.get(t, {}).get('name', 'N/A'),
-                    "數量": p['quantity'], "均價": round(p['avg_cost'], 2), "現價": cur_p, "未實現損益": round(un_pnl)
+                
+                # [span_21](start_span)30% 停損警告[span_21](end_span)
+                warning = "⚠️ 強制平倉" if ratio <= -0.3 else "正常"
+                
+                pos_data.append({
+                    "代號": t, "名稱": st.session_state.market_prices.get(t, {}).get('name', '-'),
+                    "均價": round(p['avg_cost'], 2), "現價": cur_p, "報酬率": f"{ratio:.2%}", "損益": round(un_pnl), "狀態": warning
                 })
-            st.dataframe(pd.DataFrame(disp_p), use_container_width=True, hide_index=True)
+            st.dataframe(pd.DataFrame(pos_data), use_container_width=True, hide_index=True)
+            
+            if any(d['狀態'] == "⚠️ 強制平倉" for d in pos_data):
+                [span_22](start_span)st.error("🚨 偵測到個別標的損失達 30%，請於下一個交易日執行強制出清！[span_22](end_span)")
+                
     with tab2:
         if st.session_state.trades:
             st.dataframe(pd.DataFrame(st.session_state.trades)[::-1], use_container_width=True, hide_index=True)
 
 # ==========================================
-# 8. 浮動說明按鈕
+# 8. 每日結算按鈕 (計算 Sharpe/MDD)
 # ==========================================
-st.markdown('<a href="https://github.com" target="_blank" class="help-float-btn">Help</a>', unsafe_allow_html=True)
+st.divider()
+if st.button("📥 執行每日結算 (EOD Process)"):
+    today = datetime.now().strftime('%m/%d')
+    st.session_state.daily_history.append({"date": today, "equity": current_equity})
+    sharpe, mdd = calculate_metrics()
+    st.success(f"結算完成！ Sharpe Ratio: {sharpe:.2f} | Max Drawdown: {mdd:.2%}")
