@@ -19,13 +19,10 @@ st.markdown("""
 <style>
     #MainMenu {visibility: hidden;}
     footer {visibility: hidden;}
-    
     div[data-testid="metric-container"] {
         background-color: #1e1e1e; border: 1px solid #333; padding: 15px; border-radius: 10px; border-left: 5px solid #ffb703;
     }
-    
     .stTextInput input, .stNumberInput input, .stTextArea textarea { font-size: 16px !important; }
-
     .help-float-btn {
         position: fixed; bottom: 30px; right: 30px; background-color: #ffb703; color: #000; width: 60px; height: 60px;
         border-radius: 50%; box-shadow: 0 4px 15px rgba(255, 183, 3, 0.6); font-size: 1rem; font-weight: 900;
@@ -33,7 +30,6 @@ st.markdown("""
         cursor: pointer; text-decoration: none; transition: transform 0.2s ease;
     }
     .help-float-btn:hover { transform: scale(1.1); background-color: #ff9f1c; }
-    
     .chart-container-box { height: 280px; overflow: hidden; margin-bottom: 20px; }
 </style>
 """, unsafe_allow_html=True)
@@ -57,7 +53,7 @@ if 'daily_equity_history' not in st.session_state: st.session_state.daily_equity
 if 'market_prices' not in st.session_state: st.session_state.market_prices = {}
 
 # ==========================================
-# 3. 核心數據抓取 (解決 SSL 錯誤)
+# 3. 核心數據抓取 
 # ==========================================
 @st.cache_data(ttl=600)
 def fetch_market_data():
@@ -122,6 +118,17 @@ with st.sidebar:
             st.rerun()
             
     st.divider()
+    
+    st.subheader("📥 匯出期末分析資料")
+    if st.session_state.trades:
+        df_trades = pd.DataFrame(st.session_state.trades)
+        st.download_button("匯出 每日買賣日報表 (CSV)", data=df_trades.to_csv(index=False).encode('utf-8-sig'), file_name="每日買賣日報表.csv", use_container_width=True)
+        
+    if st.session_state.daily_equity_history:
+        df_history = pd.DataFrame(st.session_state.daily_equity_history)
+        st.download_button("匯出 每日交易績效總表 (CSV)", data=df_history.to_csv(index=False).encode('utf-8-sig'), file_name="每日交易績效總表.csv", use_container_width=True)
+
+    st.divider()
     up_file = st.file_uploader("📂 載入進度 (.json)", type="json")
     if up_file:
         data = json.load(up_file)
@@ -143,7 +150,6 @@ unrealized = sum(((st.session_state.market_prices.get(t, {}).get('price', p['avg
 total_pnl = unrealized + st.session_state.realized_pnl
 total_cost = sum(p['avg_cost'] * p['quantity'] for p in st.session_state.positions.values())
 
-# 風控鎖定判斷
 now = datetime.now()
 is_halted = False
 if total_pnl <= -TOTAL_LOSS_LIMIT:
@@ -156,8 +162,8 @@ elif (datetime(2026, 6, 22) <= now <= datetime(2026, 7, 31)) and total_pnl <= -P
 m1, m2, m3, m4 = st.columns(4)
 m1.metric("帳戶總淨值", f"${eq:,.0f}")
 m2.metric("可用現金", f"${st.session_state.cash:,.0f}")
-m3.metric("總損益 (PnL)", f"${total_pnl:,.0f}", delta=f"{total_pnl:,.0f}")
-m4.metric("當前持股成本", f"${total_cost:,.0f}")
+m3.metric("總損益合計數", f"${total_pnl:,.0f}", delta=f"{total_pnl:,.0f}")
+m4.metric("投資組合總成本", f"${total_cost:,.0f}")
 
 if 0 < total_cost < MIN_PORTFOLIO_COST:
     st.warning("⚠️ 提醒：持股總成本目前低於規範之兩千萬水位。")
@@ -182,16 +188,27 @@ with c1:
 
 with c2:
     st.subheader("淨值紀錄走勢")
-    if st.button("📥 結算今日淨值", use_container_width=True):
+    if st.button("📥 結算今日交易績效總表", use_container_width=True):
         today = datetime.now().strftime('%m/%d')
-        st.session_state.daily_equity_history = [h for h in st.session_state.daily_equity_history if h['date'] != today]
-        st.session_state.daily_equity_history.append({"date": today, "equity": eq})
-        st.success(f"已記錄今日淨值：${eq:,.0f}")
+        st.session_state.daily_equity_history = [h for h in st.session_state.daily_equity_history if h['日期'] != today]
+        # 依照提案書規定欄位存檔
+        st.session_state.daily_equity_history.append({
+            "日期": today, 
+            "投資總成本": total_cost,
+            "投資總市值": eq - st.session_state.cash,
+            "未實現損益": unrealized,
+            "已實現損益": st.session_state.realized_pnl,
+            "損益合計數": total_pnl,
+            "帳戶總淨值": eq
+        })
+        st.success(f"已記錄今日績效！")
+        st.rerun()
 
-    h_df = pd.DataFrame(st.session_state.daily_equity_history + [{"date": "即時", "equity": eq}])
-    fig_l = px.line(h_df, x='date', y='equity', markers=True, template="plotly_dark")
-    fig_l.update_layout(height=250, margin=dict(t=10, b=10, l=10, r=10), paper_bgcolor='rgba(0,0,0,0)', plot_bgcolor='rgba(0,0,0,0)')
-    st.plotly_chart(fig_l, use_container_width=True)
+    if st.session_state.daily_equity_history:
+        h_df = pd.DataFrame(st.session_state.daily_equity_history)
+        fig_l = px.line(h_df, x='日期', y='帳戶總淨值', markers=True, template="plotly_dark")
+        fig_l.update_layout(height=250, margin=dict(t=10, b=10, l=10, r=10), paper_bgcolor='rgba(0,0,0,0)', plot_bgcolor='rgba(0,0,0,0)')
+        st.plotly_chart(fig_l, use_container_width=True)
 
 st.markdown("---")
 
@@ -215,9 +232,9 @@ with t_col:
             
             st.caption(f"🔍 標的: {s_name} | 收盤參考價: {ref_price}")
             
-            price = st.number_input("成交單價", min_value=0.0, value=float(ref_price), step=0.01)
-            qty = st.number_input("成交數量 (股)", min_value=1, step=1000, value=1000)
-            reason = st.text_area("買進/賣出理由 (必填)")
+            price = st.number_input("成交價格", min_value=0.0, value=float(ref_price), step=0.01)
+            qty = st.number_input("數量 (股)", min_value=1, step=1000, value=1000)
+            reason = st.text_area("買進/賣出理由 (將整合至日報表)")
             
             b1, b2 = st.columns(2)
             buy_btn = b1.form_submit_button("🟩 買進", use_container_width=True)
@@ -231,6 +248,7 @@ with t_col:
                 elif not reason: st.error("❌ 依規範必須填寫交易理由！")
                 elif not group_valid: st.error(f"❌ 標的不符組別規範！")
                 else:
+                    action = "買進" if buy_btn else "賣出"
                     exec_rule = "今日收盤價" if datetime.now().time() <= time(13, 30) else "次日收盤價"
                     
                     if is_etf: a_type, t_rate = ('債券型 ETF', 0.0) if ticker.endswith('B') else ('一般型 ETF', 0.001)
@@ -254,7 +272,17 @@ with t_col:
                             pos['avg_cost'] = ((pos['avg_cost'] * pos['quantity']) + net_cost) / new_q
                             pos['quantity'] = new_q
                             st.session_state.positions[ticker] = pos
-                            st.session_state.trades.append({"時間": datetime.now().strftime("%m/%d %H:%M"), "動作": "買進", "代號": ticker, "名稱": s_name, "單價": price, "數量": qty, "理由": reason, "規則": exec_rule})
+                            
+                            # 依據提案書「每日買賣日報表」格式紀錄
+                            st.session_state.trades.append({
+                                "交易日期": datetime.now().strftime("%Y-%m-%d %H:%M"), 
+                                "交易標的": f"{ticker} {s_name}", 
+                                "買賣方向": action, 
+                                "成交價格": price, 
+                                "數量": qty, 
+                                "理由與日誌": reason, 
+                                "計價規則": exec_rule
+                            })
                             st.rerun()
 
                     if sell_btn:
@@ -268,25 +296,42 @@ with t_col:
                             st.session_state.positions[ticker]['quantity'] -= qty
                             if st.session_state.positions[ticker]['quantity'] == 0: 
                                 del st.session_state.positions[ticker]
-                            st.session_state.trades.append({"時間": datetime.now().strftime("%m/%d %H:%M"), "動作": "賣出", "代號": ticker, "名稱": s_name, "單價": price, "數量": qty, "理由": reason, "規則": exec_rule})
+                                
+                            st.session_state.trades.append({
+                                "交易日期": datetime.now().strftime("%Y-%m-%d %H:%M"), 
+                                "交易標的": f"{ticker} {s_name}", 
+                                "買賣方向": action, 
+                                "成交價格": price, 
+                                "數量": qty, 
+                                "理由與日誌": reason, 
+                                "計價規則": exec_rule
+                            })
                             st.rerun()
 
 # ==========================================
-# 8. 庫存展示與 30% 停損警示
+# 8. 報表展示區 (完全對齊提案書欄位)
 # ==========================================
 with l_col:
-    tab1, tab2 = st.tabs(["📊 當前持股庫存", "📝 交易日誌紀錄"])
+    tab1, tab2 = st.tabs(["📊 每日交易績效總表 (即時部位)", "📝 每日買賣日報表 (含日誌)"])
+    
     with tab1:
         if st.session_state.positions:
             disp_p = []
             for t, p in st.session_state.positions.items():
                 cur_p = st.session_state.market_prices.get(t, {}).get('price', p['avg_cost'])
+                cost_basis = p['avg_cost'] * p['quantity']
+                mkt_value = cur_p * p['quantity']
+                un_pnl = mkt_value - cost_basis
                 ratio = (cur_p / p['avg_cost']) - 1 if p['avg_cost'] > 0 else 0
                 status = "🚨 30%強制停損" if ratio <= -0.3 else "正常"
+                
                 disp_p.append({
-                    "標的": t, "名稱": st.session_state.market_prices.get(t, {}).get('name', 'N/A'),
-                    "數量": p['quantity'], "均價": round(p['avg_cost'], 2), 
-                    "現價": cur_p, "報酬率": f"{ratio:.2%}", "狀態": status
+                    "交易標的": f"{t} {st.session_state.market_prices.get(t, {}).get('name', '')}",
+                    "投資成本": round(cost_basis), 
+                    "投資市值": round(mkt_value), 
+                    "未實現損益": round(un_pnl), 
+                    "報酬率": f"{ratio:.2%}", 
+                    "狀態": status
                 })
             st.dataframe(pd.DataFrame(disp_p), use_container_width=True, hide_index=True)
             if any("停損" in str(x) for x in disp_p):
