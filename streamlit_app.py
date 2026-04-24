@@ -42,9 +42,9 @@ st.markdown("""
 # ==========================================
 # 2. 系統狀態與常數 (依據 STP 專案提案書)
 # ==========================================
-[span_4](start_span)INITIAL_CAPITAL = 200000000    # 初始資金 2 億[span_4](end_span)
-[span_5](start_span)COST_LIMIT_PER_TICKER = 40000000  # 單一標的成本上限 4,000 萬[span_5](end_span)
-[span_6](start_span)FEE_RATE = 0.0004              # 法人單手續費率 0.04%[span_6](end_span)
+INITIAL_CAPITAL = 200000000       # 初始資金 2 億
+COST_LIMIT_PER_TICKER = 40000000  # 單一標的成本上限 4,000 萬
+FEE_RATE = 0.0004                 # 法人單手續費率 0.04%
 
 if 'cash' not in st.session_state: st.session_state.cash = INITIAL_CAPITAL
 if 'realized_pnl' not in st.session_state: st.session_state.realized_pnl = 0
@@ -76,13 +76,13 @@ def get_equity():
 def show_help_dialog():
     st.markdown(f"""
     #### 1. 買進限制 (Pre-trade Control)
-    * [span_7](start_span)單一標的總成本上限：**{COST_LIMIT_PER_TICKER/10000:,.0f} 萬元**[span_7](end_span)。
-    * [span_8](start_span)法人級手續費：**0.04%**[span_8](end_span)。
+    * 單一標的總成本上限：**{COST_LIMIT_PER_TICKER/10000:,.0f} 萬元**。
+    * 法人級手續費：**0.04%**。
     
     #### 2. 證交稅判斷 (僅賣出收取)
-    * **[span_9](start_span)股票**：非 00 開頭，課徵 **0.3%**[span_9](end_span)。
-    * **[span_10](start_span)一般型 ETF**：00 開頭，課徵 **0.1%**[span_10](end_span)。
-    * **[span_11](start_span)債券型 ETF**：00 開頭且 B 結尾，**暫停課徵 (0%)**[span_11](end_span)。
+    * **股票**：非 00 開頭，課徵 **0.3%**。
+    * **一般型 ETF**：00 開頭 (非 B 結尾)，課徵 **0.1%**。
+    * **債券型 ETF**：00 開頭且 B 結尾，**暫停課徵 (0%)**。
     
     #### 3. 每日結算與存檔
     * 下班前點擊 **[更新收盤價]**。
@@ -99,7 +99,8 @@ with st.sidebar:
         new_prices = fetch_market_data()
         if new_prices:
             st.session_state.market_prices = new_prices
-            st.success("報價更新完成"); st.rerun()
+            st.success("報價更新完成")
+            st.rerun()
     st.divider()
     up_file = st.file_uploader("📂 載入進度 (.json)", type="json")
     if up_file:
@@ -115,7 +116,7 @@ with st.sidebar:
 # ==========================================
 st.title("📈 STP 操盤手模擬訓練平台")
 
-# [span_12](start_span)風控：單一標的損失 30% 強制警告[span_12](end_span)
+# 風控：單一標的損失 30% 強制警告
 for t, p in st.session_state.positions.items():
     cur_p = st.session_state.market_prices.get(t, p['avg_cost'])
     if p['avg_cost'] > 0 and (cur_p / p['avg_cost'] - 1) <= -0.3:
@@ -190,7 +191,7 @@ with t_col:
             if not ticker or price <= 0:
                 st.error("請輸入正確標的與單價")
             else:
-                # 分類與稅率
+                # 判斷類型與稅率
                 if ticker.startswith('00'):
                     a_type, t_rate = ('債券型 ETF', 0.0) if ticker.endswith('B') else ('一般型 ETF', 0.001)
                 else:
@@ -201,11 +202,12 @@ with t_col:
                 
                 if do_buy:
                     net_cost = base + fee
-                    # [span_13](start_span)【核心風控】檢查單一標的上限 4,000 萬[span_13](end_span)
+                    # 【核心風控】檢查單一標的上限 4,000 萬
                     cur_cost = st.session_state.positions.get(ticker, {}).get('avg_cost', 0) * st.session_state.positions.get(ticker, {}).get('quantity', 0)
                     if (cur_cost + net_cost) > COST_LIMIT_PER_TICKER:
                         st.error(f"❌ 攔截：總成本將達 {cur_cost + net_cost:,.0f}，超過法人風控 4,000 萬上限！")
-                    elif net_cost > st.session_state.cash: st.error("資金不足")
+                    elif net_cost > st.session_state.cash:
+                        st.error("❌ 資金不足")
                     else:
                         st.session_state.cash -= net_cost
                         pos = st.session_state.positions.get(ticker, {'quantity': 0, 'avg_cost': 0, 'type': a_type})
@@ -217,14 +219,16 @@ with t_col:
                         st.rerun()
 
                 if do_sell:
-                    if ticker not in st.session_state.positions or st.session_state.positions[ticker]['quantity'] < qty: st.error("庫存不足")
+                    if ticker not in st.session_state.positions or st.session_state.positions[ticker]['quantity'] < qty: 
+                        st.error("❌ 庫存不足")
                     else:
                         tax = int(base * t_rate)
                         net_recv = base - fee - tax
                         st.session_state.cash += net_recv
                         st.session_state.realized_pnl += (net_recv - (st.session_state.positions[ticker]['avg_cost'] * qty))
                         st.session_state.positions[ticker]['quantity'] -= qty
-                        if st.session_state.positions[ticker]['quantity'] == 0: del st.session_state.positions[ticker]
+                        if st.session_state.positions[ticker]['quantity'] == 0: 
+                            del st.session_state.positions[ticker]
                         st.session_state.trades.append({"time": datetime.now().strftime("%H:%M:%S"), "action": "賣出", "ticker": ticker, "price": price, "qty": qty, "net": net_recv, "note": note})
                         st.rerun()
 
@@ -232,7 +236,7 @@ with l_col:
     t1, t2 = st.tabs(["📊 庫存部位", "📝 交易明細"])
     with t1:
         if st.session_state.positions:
-            df_p = pd.DataFrame([{"標的": t, "類型": p['type'], "數量": p['quantity'], "均價": round(p['avg_cost'], 1), 
+            df_p = pd.DataFrame([{"標的": t, "類型": p['type'], "數量": p['quantity'], "均價": round(p['avg_cost'], 2), 
                                   "市價": st.session_state.market_prices.get(t, p['avg_cost']),
                                   "未實現損益": round((st.session_state.market_prices.get(t, p['avg_cost']) - p['avg_cost']) * p['quantity'])} 
                                  for t, p in st.session_state.positions.items()])
@@ -242,7 +246,34 @@ with l_col:
             st.dataframe(pd.DataFrame(st.session_state.trades)[::-1], use_container_width=True, hide_index=True)
 
 # ==========================================
-# 8. 圓形浮動按鈕渲染 (點擊觸發 Dialog)
+# 8. 圓形浮動按鈕渲染 (透過 JS 觸發隱藏的 Streamlit Button)
 # ==========================================
-st.markdown('<a href="javascript:document.getElementsByClassName(\'stButton\')[3].click();" class="help-float-btn">說明</a>', unsafe_allow_html=True)
-if st.button("說明", key="invisible_help", help="查看 SOP"): show_help_dialog()
+# 注入一段 JS，當點擊 href 時，去尋找畫面上特定文本的按鈕並觸發點擊
+components_html = """
+<script>
+function triggerHelp() {
+    const buttons = window.parent.document.querySelectorAll('button');
+    for (let i = 0; i < buttons.length; i++) {
+        if (buttons[i].innerText.includes('隱藏說明按鈕')) {
+            buttons[i].click();
+            break;
+        }
+    }
+}
+</script>
+<a href="javascript:triggerHelp();" class="help-float-btn">說明</a>
+"""
+st.components.v1.html(components_html, height=0)
+
+# 隱藏一個實際的 Streamlit Button 供 JS 呼叫
+if st.button("隱藏說明按鈕", key="hidden_help"):
+    show_help_dialog()
+
+# 用 CSS 將該真實按鈕隱藏
+st.markdown("""
+<style>
+    button[kind="secondary"]:has(div[data-testid="stMarkdownContainer"] > p:contains("隱藏說明按鈕")) {
+        display: none;
+    }
+</style>
+""", unsafe_allow_html=True)
