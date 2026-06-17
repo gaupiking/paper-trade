@@ -34,12 +34,19 @@ try:
     if df.empty:
         st.error("找不到該股票資料，請檢查代號是否正確。")
     else:
+        # 【修正】處理新版 yfinance 的多重索引欄位問題
+        if isinstance(df.columns, pd.MultiIndex):
+            df.columns = df.columns.droplevel(1)
+        
+        # 確保關鍵欄位都是乾淨的數字
+        for col in ['Open', 'High', 'Low', 'Close', 'Volume']:
+            df[col] = pd.to_numeric(df[col], errors='coerce')
+
         # 計算移動平均線
         df['MA_Fast'] = df['Close'].rolling(window=ma_fast).mean()
         df['MA_Slow'] = df['Close'].rolling(window=ma_slow).mean()
 
         # 4. 頂部關鍵指標區塊 (st.columns & st.metric)
-        # 取得最新一筆和前一筆的資料來計算漲跌
         last_row = df.iloc[-1]
         prev_row = df.iloc[-2]
         
@@ -47,12 +54,16 @@ try:
         prev_price = float(prev_row['Close'])
         price_change = last_price - prev_price
         price_change_pct = (price_change / prev_price) * 100
+        
+        max_price = float(df['High'].max())
+        min_price = float(df['Low'].min())
+        last_volume = int(last_row['Volume'])
 
         col1, col2, col3, col4 = st.columns(4)
         col1.metric(label=f"{ticker} 最新收盤價", value=f"${last_price:.2f}", delta=f"{price_change:.2f} ({price_change_pct:.2f}%)")
-        col2.metric(label="期間最高價", value=f"${df['High'].max().values[0]:.2f}")
-        col3.metric(label="期間最低價", value=f"${df['Low'].min().values[0]:.2f}")
-        col4.metric(label="當日成交量", value=f"{int(last_row['Volume'].values[0]):,}")
+        col2.metric(label="期間最高價", value=f"${max_price:.2f}")
+        col3.metric(label="期間最低價", value=f"${min_price:.2f}")
+        col4.metric(label="當日成交量", value=f"{last_volume:,}")
 
         st.markdown("---")
 
@@ -79,8 +90,10 @@ try:
         with tab2:
             st.subheader("原始數據檢視")
             st.write("你可以點擊表格欄位進行排序，或點擊右上角下載為 CSV。")
-            # 使用 st.dataframe 呈現可互動表格
-            st.dataframe(df.descending() if hasattr(df, 'descending') else df.sort_index(ascending=False), use_container_width=True)
+            
+            # 依日期最新到最舊排序顯示
+            df_display = df.sort_index(ascending=False)
+            st.dataframe(df_display, use_container_width=True)
 
         with tab3:
             st.subheader("黃金交叉 / 死亡交叉 策略提示")
