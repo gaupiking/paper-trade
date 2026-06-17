@@ -3,69 +3,126 @@ import pandas as pd
 import requests
 import sqlite3
 import json
+import math
 from pathlib import Path
-from datetime import datetime, time, timedelta
-import plotly.express as px
+from datetime import datetime, timedelta
 import plotly.graph_objects as go
+import plotly.express as px
 import urllib3
 
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
 # =========================================================
-# 基本設定
+# Page
 # =========================================================
 st.set_page_config(
-    page_title="STP 模擬交易平台 | 台股版",
+    page_title="STP 模擬交易平台｜台股競賽版",
     layout="wide",
     initial_sidebar_state="collapsed"
 )
 
+# =========================================================
+# Style
+# =========================================================
+st.markdown("""
+<style>
+.block-container { padding-top: 1rem; padding-bottom: 1rem; max-width: 100%; }
+div[data-testid="metric-container"] {
+    background: #111827;
+    border: 1px solid #374151;
+    border-radius: 14px;
+    padding: 12px 14px;
+    box-shadow: 0 6px 16px rgba(0,0,0,0.15);
+}
+div[data-testid="stDataFrame"] {
+    border: 1px solid #2b2f3a;
+    border-radius: 12px;
+    overflow: hidden;
+}
+.stButton > button {
+    border-radius: 10px;
+    font-weight: 700;
+}
+.section-card {
+    border: 1px solid #2b2f3a;
+    border-radius: 16px;
+    padding: 14px 14px 8px 14px;
+    background: linear-gradient(180deg, rgba(17,24,39,0.95), rgba(17,24,39,0.85));
+    box-shadow: 0 8px 22px rgba(0,0,0,0.18);
+}
+.small-label {
+    font-size: 0.82rem;
+    color: #9ca3af;
+    margin-bottom: 0.15rem;
+}
+.big-number {
+    font-size: 1.35rem;
+    font-weight: 800;
+    color: #f9fafb;
+}
+.sub-number {
+    font-size: 0.92rem;
+    color: #d1d5db;
+}
+hr { margin: 0.6rem 0 0.9rem 0; }
+</style>
+""", unsafe_allow_html=True)
+
+# =========================================================
+# Constants
+# =========================================================
 BASE_DIR = Path(__file__).resolve().parent
 DB_PATH = str(BASE_DIR / "stp_local.db")
 
 INITIAL_CAPITAL = 200000000
 FEE_RATE = 0.0004
-TAX_RATE_STOCK = 0.003
-TAX_RATE_ETF = 0.001
-COST_LIMIT_PER_TICKER = 40000000
-MIN_PORTFOLIO_COST = 20000000
+TAX_STOCK = 0.003
+TAX_ETF = 0.001
+COST_LIMIT_PER_GROUP = 40000000
 TOTAL_LOSS_LIMIT = 20000000
 PHASE_LOSS_LIMIT = 10000000
+DRAWDOWN_LIMIT = 0.10
 
 TWSE_LIVE_URL = "https://openapi.twse.com.tw/api/v2/RealTimeQuote"
-TWSE_DAILY_URL = "https://openapi.twse.com.tw/v1/exchangeReport/STOCK_DAY_ALL"
 TPEX_LIVE_URL = "https://www.tpex.org.tw/openapi/v1/tpex_mainboard_quotes"
 FINMIND_BASE = "https://api.finmindtrade.com/api/v4/data"
 
-DEFAULT_SYMBOLS = ["2330", "2317", "0050", "0056", "2603", "2881", "6121", "6208"]
+DEFAULT_WATCH_ETF = ["0050", "0056", "006208", "00878"]
+DEFAULT_WATCH_STOCK = ["2330", "2317", "2454", "2881"]
 
 # =========================================================
-# Session state
+# Session State
 # =========================================================
 defaults = {
-    "group": "股票投資組",
-    "cash": INITIAL_CAPITAL,
-    "realized_pnl": 0,
-    "positions": {},
+    "mode": "ETF組",
+    "cash_etf": INITIAL_CAPITAL,
+    "cash_stock": INITIAL_CAPITAL,
+    "realized_etf": 0.0,
+    "realized_stock": 0.0,
+    "positions_etf": {},
+    "positions_stock": {},
     "orders": [],
-    "fills": [],
-    "daily_history": [],
-    "watchlist": DEFAULT_SYMBOLS[:],
-    "selected_symbol": "2330",
-    "market_prices": {},
-    "daily_quotes": {},
-    "last_refresh": None,
+    "trades": [],
+    "performance": [],
+    "watch_etf": DEFAULT_WATCH_ETF[:],
+    "watch_stock": DEFAULT_WATCH_STOCK[:],
+    "selected_symbol": "0050",
     "source_mode": "AUTO",
     "finmind_token": "",
-    "show_five_level": True,
+    "yahoo_debug": False,
+    "market_prices": {},
+    "daily_quotes": {},
+    "dividend_preview": [],
+    "last_refresh": None,
+    "debug_logs": [],
+    "max_equity": INITIAL_CAPITAL,
 }
-
 for k, v in defaults.items():
     if k not in st.session_state:
         st.session_state[k] = v
 
 # =========================================================
-# DB
+# DB helpers
 # =========================================================
 def get_conn():
     conn = sqlite3.connect(DB_PATH, check_same_thread=False)
@@ -75,7 +132,6 @@ def get_conn():
 def init_db():
     conn = get_conn()
     cur = conn.cursor()
-
     cur.execute("""
     CREATE TABLE IF NOT EXISTS quotes_live (
         symbol TEXT,
@@ -90,7 +146,6 @@ def init_db():
         PRIMARY KEY (symbol, quote_time)
     )
     """)
-
     cur.execute("""
     CREATE TABLE IF NOT EXISTS prices_daily (
         symbol TEXT,
@@ -107,11 +162,11 @@ def init_db():
         PRIMARY KEY (symbol, trade_date)
     )
     """)
-
     cur.execute("""
     CREATE TABLE IF NOT EXISTS orders (
         order_id INTEGER PRIMARY KEY AUTOINCREMENT,
         created_at TEXT,
+        group_name TEXT,
         symbol TEXT,
         symbol_name TEXT,
         side TEXT,
@@ -125,12 +180,12 @@ def init_db():
         avg_fill_price REAL DEFAULT 0
     )
     """)
-
     cur.execute("""
     CREATE TABLE IF NOT EXISTS fills (
         fill_id INTEGER PRIMARY KEY AUTOINCREMENT,
         order_id INTEGER,
         filled_at TEXT,
+        group_name TEXT,
         symbol TEXT,
         side TEXT,
         fill_price REAL,
@@ -141,26 +196,32 @@ def init_db():
         note TEXT
     )
     """)
-
     cur.execute("""
-    CREATE TABLE IF NOT EXISTS watchlist (
-        symbol TEXT PRIMARY KEY,
-        note TEXT DEFAULT ''
+    CREATE TABLE IF NOT EXISTS dividend_preview (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        symbol TEXT,
+        symbol_name TEXT,
+        ex_date TEXT,
+        cash_dividend REAL,
+        stock_dividend REAL,
+        source TEXT,
+        raw_json TEXT
     )
     """)
-
     cur.execute("""
-    CREATE TABLE IF NOT EXISTS leaderboard_snapshots (
+    CREATE TABLE IF NOT EXISTS leaderboard (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
         snapshot_date TEXT,
         group_name TEXT,
         cash REAL,
         equity REAL,
         pnl REAL,
-        return_pct REAL
+        return_pct REAL,
+        drawdown REAL,
+        capital_usage REAL,
+        sharpe REAL
     )
     """)
-
     conn.commit()
     conn.close()
 
@@ -180,7 +241,7 @@ def safe_read_table(conn, table_name, order_col=None):
     except Exception:
         return pd.DataFrame()
 
-def db_upsert_many(table, rows, pk_cols):
+def upsert_many(table, rows, pk_cols):
     if not rows:
         return
     conn = get_conn()
@@ -219,38 +280,103 @@ def safe_int(v, default=0):
         return default
 
 def is_etf(symbol):
-    return symbol.startswith("00") or symbol.endswith("B")
+    return symbol.startswith("00") or symbol.startswith("006") or symbol.startswith("008")
 
-def is_twse(symbol):
-    return symbol.isdigit() and len(symbol) == 4 and not symbol.startswith(("6", "8", "9"))
-
-def request_json(url, params=None, headers=None, timeout=12):
-    headers = headers or {"User-Agent": "Mozilla/5.0"}
+def request_json(url, params=None, timeout=12):
+    headers = {"User-Agent": "Mozilla/5.0"}
     r = requests.get(url, params=params, headers=headers, timeout=timeout, verify=False)
     r.raise_for_status()
     return r.json()
 
-def get_equity():
-    stock_val = 0
-    for sym, pos in st.session_state.positions.items():
-        cur_price = st.session_state.market_prices.get(sym, {}).get("price", pos["avg_cost"])
-        stock_val += cur_price * pos["qty"]
-    return st.session_state.cash + stock_val
+def fmt_money(x):
+    return f"${x:,.0f}"
 
-def get_unrealized_pnl():
-    total = 0
-    for sym, pos in st.session_state.positions.items():
-        cur_price = st.session_state.market_prices.get(sym, {}).get("price", pos["avg_cost"])
-        total += (cur_price - pos["avg_cost"]) * pos["qty"]
+def group_cash():
+    return st.session_state.cash_etf if st.session_state.mode == "ETF組" else st.session_state.cash_stock
+
+def set_group_cash(v):
+    if st.session_state.mode == "ETF組":
+        st.session_state.cash_etf = v
+    else:
+        st.session_state.cash_stock = v
+
+def group_realized():
+    return st.session_state.realized_etf if st.session_state.mode == "ETF組" else st.session_state.realized_stock
+
+def set_group_realized(v):
+    if st.session_state.mode == "ETF組":
+        st.session_state.realized_etf = v
+    else:
+        st.session_state.realized_stock = v
+
+def group_positions():
+    return st.session_state.positions_etf if st.session_state.mode == "ETF組" else st.session_state.positions_stock
+
+def set_group_positions(v):
+    if st.session_state.mode == "ETF組":
+        st.session_state.positions_etf = v
+    else:
+        st.session_state.positions_stock = v
+
+def watchlist():
+    return st.session_state.watch_etf if st.session_state.mode == "ETF組" else st.session_state.watch_stock
+
+def current_positions_value():
+    total = 0.0
+    for sym, pos in group_positions().items():
+        px = st.session_state.market_prices.get(sym, {}).get("price", pos["avg_cost"])
+        total += px * pos["qty"]
     return total
 
-def get_pos_cost():
-    return sum(pos["avg_cost"] * pos["qty"] for pos in st.session_state.positions.values())
+def current_unrealized():
+    total = 0.0
+    for sym, pos in group_positions().items():
+        px = st.session_state.market_prices.get(sym, {}).get("price", pos["avg_cost"])
+        total += (px - pos["avg_cost"]) * pos["qty"]
+    return total
+
+def current_equity():
+    return group_cash() + current_positions_value()
+
+def current_total_pnl():
+    return current_unrealized() + group_realized()
+
+def capital_usage():
+    eq = current_equity()
+    return 0 if eq <= 0 else current_positions_value() / eq
+
+def max_drawdown():
+    if not st.session_state.performance:
+        return 0.0
+    eqs = [x["帳戶總淨值"] for x in st.session_state.performance]
+    peak = eqs[0]
+    mdd = 0.0
+    for v in eqs:
+        peak = max(peak, v)
+        dd = 0 if peak == 0 else (peak - v) / peak
+        mdd = max(mdd, dd)
+    return mdd
+
+def sharpe_like():
+    if len(st.session_state.performance) < 2:
+        return 0.0
+    vals = [x["帳戶總淨值"] for x in st.session_state.performance]
+    rets = []
+    for i in range(1, len(vals)):
+        prev = vals[i - 1]
+        if prev > 0:
+            rets.append((vals[i] - prev) / prev)
+    if not rets:
+        return 0.0
+    avg = sum(rets) / len(rets)
+    var = sum((x - avg) ** 2 for x in rets) / max(1, len(rets) - 1)
+    std = math.sqrt(var)
+    return 0.0 if std == 0 else (avg / std) * math.sqrt(252)
 
 # =========================================================
-# 資料抓取
+# Data sources
 # =========================================================
-@st.cache_data(ttl=15)
+@st.cache_data(ttl=20)
 def fetch_twse_live(symbols):
     try:
         data = request_json(TWSE_LIVE_URL, timeout=15)
@@ -266,22 +392,17 @@ def fetch_twse_live(symbols):
             last = safe_float(item.get("Price") or item.get("ClosingPrice"))
             prev = safe_float(item.get("PreviousClosePrice") or item.get("ReferencePrice"))
             vol = safe_int(item.get("TodayVolume"))
-            change = last - prev if prev else 0
-            pct = (change / prev * 100) if prev else 0
+            chg = last - prev if prev else 0
+            pct = (chg / prev * 100) if prev else 0
             rows.append({
-                "symbol": sym,
-                "last_price": last,
-                "prev_close": prev,
-                "change_val": change,
-                "change_pct": pct,
-                "volume": vol,
+                "symbol": sym, "last_price": last, "prev_close": prev,
+                "change_val": chg, "change_pct": pct, "volume": vol,
                 "quote_time": datetime.now().isoformat(timespec="seconds"),
-                "market_source": "TWSE",
-                "raw_json": json.dumps(item, ensure_ascii=False)
+                "market_source": "TWSE", "raw_json": json.dumps(item, ensure_ascii=False)
             })
     return rows
 
-@st.cache_data(ttl=15)
+@st.cache_data(ttl=20)
 def fetch_tpex_live(symbols):
     try:
         data = request_json(TPEX_LIVE_URL, timeout=15)
@@ -297,20 +418,44 @@ def fetch_tpex_live(symbols):
             last = safe_float(item.get("Close"))
             prev = safe_float(item.get("ReferencePrice") or item.get("PreviousClose"))
             vol = safe_int(item.get("TradeVolume"))
-            change = last - prev if prev else 0
-            pct = (change / prev * 100) if prev else 0
+            chg = last - prev if prev else 0
+            pct = (chg / prev * 100) if prev else 0
             rows.append({
-                "symbol": sym,
-                "last_price": last,
-                "prev_close": prev,
-                "change_val": change,
-                "change_pct": pct,
-                "volume": vol,
+                "symbol": sym, "last_price": last, "prev_close": prev,
+                "change_val": chg, "change_pct": pct, "volume": vol,
                 "quote_time": datetime.now().isoformat(timespec="seconds"),
-                "market_source": "TPEx",
-                "raw_json": json.dumps(item, ensure_ascii=False)
+                "market_source": "TPEx", "raw_json": json.dumps(item, ensure_ascii=False)
             })
     return rows
+
+@st.cache_data(ttl=300)
+def fetch_yahoo_debug(symbols):
+    logs = []
+    rows = []
+    for sym in symbols:
+        try:
+            url = f"https://query1.finance.yahoo.com/v8/finance/chart/{sym}.TW"
+            data = request_json(url, timeout=12)
+            result = data.get("chart", {}).get("result", [None])[0]
+            if not result:
+                logs.append({"股票代號": sym, "狀態": "錯誤", "訊息": "no result"})
+                continue
+            meta = result.get("meta", {})
+            last = safe_float(meta.get("regularMarketPrice"))
+            prev = safe_float(meta.get("previousClose"))
+            vol = safe_int(meta.get("regularMarketVolume"))
+            chg = last - prev if prev else 0
+            pct = (chg / prev * 100) if prev else 0
+            rows.append({
+                "symbol": sym, "last_price": last, "prev_close": prev,
+                "change_val": chg, "change_pct": pct, "volume": vol,
+                "quote_time": datetime.now().isoformat(timespec="seconds"),
+                "market_source": "Yahoo", "raw_json": json.dumps(data, ensure_ascii=False)
+            })
+            logs.append({"股票代號": sym, "狀態": "成功", "訊息": f"價格={last}"})
+        except Exception as e:
+            logs.append({"股票代號": sym, "狀態": "錯誤", "訊息": str(e)})
+    return rows, logs
 
 @st.cache_data(ttl=3600)
 def fetch_finmind_daily(symbols, token):
@@ -348,465 +493,444 @@ def fetch_finmind_daily(symbols, token):
             pass
     return rows
 
-@st.cache_data(ttl=3600)
-def fetch_finmind_chip(symbols, token):
-    if not token:
-        return {}
-    chip_map = {}
-    for sym in symbols:
-        try:
-            params = {
-                "dataset": "TaiwanStockInstitutionalInvestorsBuySell",
-                "data_id": sym,
-                "start_date": (datetime.now() - timedelta(days=10)).date().isoformat(),
-                "end_date": datetime.now().date().isoformat(),
-                "token": token
-            }
-            data = request_json(FINMIND_BASE, params=params, timeout=20)
-            ds = data.get("data", [])
-            if ds:
-                chip_map[sym] = ds[-1]
-        except:
-            pass
-    return chip_map
-
 @st.cache_data(ttl=86400)
-def fetch_mops_actions(symbols):
-    today = datetime.now().date().isoformat()
-    return [{
-        "symbol": sym,
-        "action_type": "公告",
-        "announcement_date": today,
-        "effective_date": today,
-        "amount": None,
-        "raw_json": json.dumps({"note": "MOPS 先保留資料結構，後續可接真實解析"}, ensure_ascii=False)
-    } for sym in symbols]
+def fetch_dividend_preview(symbols):
+    today = datetime.now().date()
+    rows = []
+    for sym in symbols:
+        rows.append({
+            "symbol": sym,
+            "symbol_name": sym,
+            "ex_date": (today + timedelta(days=30)).isoformat(),
+            "cash_dividend": 0.0,
+            "stock_dividend": 0.0,
+            "source": "MOPS/預告",
+            "raw_json": json.dumps({"note": "預留除權息預告資料"}, ensure_ascii=False)
+        })
+    return rows
 
-def market_price_map(rows):
-    mp = {}
-    for r in rows:
-        mp[r["symbol"]] = {
-            "name": "",
-            "price": r.get("last_price", 0.0),
-            "prev_close": r.get("prev_close", 0.0),
-            "source": r.get("market_source", ""),
-            "quote_time": r.get("quote_time", "")
-        }
-    return mp
-
-def load_market_data():
+def market_router(symbols):
     finmind_token = st.session_state.finmind_token.strip()
-    symbols = st.session_state.watchlist
-
-    live_rows = fetch_twse_live(symbols)
-    if not live_rows:
+    debug_logs = []
+    if st.session_state.source_mode == "AUTO":
+        live_rows = fetch_twse_live(symbols)
+        if not live_rows:
+            live_rows = fetch_tpex_live(symbols)
+        if not live_rows:
+            live_rows, debug_logs = fetch_yahoo_debug(symbols)
+    elif st.session_state.source_mode == "TWSE":
+        live_rows = fetch_twse_live(symbols)
+    else:
         live_rows = fetch_tpex_live(symbols)
 
     daily_rows = fetch_finmind_daily(symbols, finmind_token)
-    chip_map = fetch_finmind_chip(symbols, finmind_token)
-    action_rows = fetch_mops_actions(symbols)
+    dividend_rows = fetch_dividend_preview(symbols)
+    return live_rows, daily_rows, dividend_rows, debug_logs
 
-    if live_rows:
-        st.session_state.market_prices = market_price_map(live_rows)
-        db_upsert_many("quotes_live", live_rows, ["symbol", "quote_time"])
+def save_trade(side, symbol, price, qty, reason, order_type):
+    now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    fee = round(price * qty * FEE_RATE)
+    tax = 0
+    pnl = 0.0
+    pos = group_positions()
 
-    if daily_rows:
-        for r in daily_rows:
-            if r["symbol"] in chip_map:
-                r["chip_json"] = json.dumps(chip_map[r["symbol"]], ensure_ascii=False)
-        st.session_state.daily_quotes = {r["symbol"]: r for r in daily_rows}
-        db_upsert_many("prices_daily", daily_rows, ["symbol", "trade_date"])
+    if side == "買入":
+        total = price * qty + fee
+        if total > group_cash():
+            return False, "可用資金不足", None
+        set_group_cash(group_cash() - total)
+        old = pos.get(symbol, {"qty": 0, "avg_cost": 0.0, "type": "ETF" if is_etf(symbol) else "股票"})
+        new_qty = old["qty"] + qty
+        new_avg = ((old["avg_cost"] * old["qty"]) + total) / new_qty
+        old["qty"] = new_qty
+        old["avg_cost"] = new_avg
+        old["type"] = "ETF" if is_etf(symbol) else "股票"
+        pos[symbol] = old
+        set_group_positions(pos)
+    else:
+        if symbol not in pos or pos[symbol]["qty"] < qty:
+            return False, "庫存不足", None
+        tax = round(price * qty * (TAX_ETF if is_etf(symbol) else TAX_STOCK))
+        pnl = (price - pos[symbol]["avg_cost"]) * qty - fee - tax
+        set_group_cash(group_cash() + (price * qty - fee - tax))
+        set_group_realized(group_realized() + pnl)
+        pos[symbol]["qty"] -= qty
+        if pos[symbol]["qty"] <= 0:
+            del pos[symbol]
+        set_group_positions(pos)
 
-    if action_rows:
-        db_upsert_many("corporate_actions", action_rows, ["symbol", "action_type", "announcement_date", "effective_date", "amount"])
+    conn = get_conn()
+    cur = conn.cursor()
+    cur.execute("""
+        INSERT INTO orders
+        (created_at, group_name, symbol, symbol_name, side, order_type, price, qty, status, reason, filled_qty, remaining_qty, avg_fill_price)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    """, (now, st.session_state.mode, symbol, symbol, side, order_type, price, qty, "已成交", reason, qty, 0, price))
+    oid = cur.lastrowid
+    cur.execute("""
+        INSERT INTO fills
+        (order_id, filled_at, group_name, symbol, side, fill_price, fill_qty, fee, tax, pnl, note)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    """, (oid, now, st.session_state.mode, symbol, side, price, qty, fee, tax, pnl, reason))
+    conn.commit()
+    conn.close()
 
-    st.session_state.last_refresh = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-    return len(live_rows), len(daily_rows), len(action_rows)
+    st.session_state.orders.insert(0, {
+        "委託時間": now, "組別": st.session_state.mode, "股票代號": symbol,
+        "買賣方向": side, "委託方式": order_type, "委託價": price,
+        "數量": qty, "狀態": "已成交", "理由": reason
+    })
+    st.session_state.trades.insert(0, {
+        "交易時間": now, "組別": st.session_state.mode, "交易標的": symbol,
+        "買賣方向": side, "委託方式": order_type, "成交價": price,
+        "數量": qty, "手續費": fee, "證交稅": tax, "理由": reason, "損益": pnl
+    })
+    return True, "成交完成", oid
 
 # =========================================================
-# 初始化
+# Init
 # =========================================================
 init_db()
 if not st.session_state.market_prices:
-    load_market_data()
+    live_rows, daily_rows, dividend_rows, debug_logs = market_router(st.session_state.watch_etf + st.session_state.watch_stock)
+    if live_rows:
+        st.session_state.market_prices = {
+            r["symbol"]: {"price": r["last_price"], "prev_close": r["prev_close"], "source": r["market_source"], "quote_time": r["quote_time"]}
+            for r in live_rows
+        }
+        upsert_many("quotes_live", live_rows, ["symbol", "quote_time"])
+    if daily_rows:
+        st.session_state.daily_quotes = {r["symbol"]: r for r in daily_rows}
+        upsert_many("prices_daily", daily_rows, ["symbol", "trade_date"])
+    if dividend_rows:
+        st.session_state.dividend_preview = dividend_rows
+        upsert_many("dividend_preview", dividend_rows, ["symbol", "ex_date", "source"])
+    st.session_state.debug_logs = debug_logs
 
 # =========================================================
-# 側邊欄
+# Header
 # =========================================================
-with st.sidebar:
-    st.title("台股模擬交易")
-    st.caption("simTrade 風格 V1")
+st.title("模擬交易控制台")
 
-    new_group = st.radio("交易組別", ["股票投資組", "ETF投資組"])
-    if new_group != st.session_state.group:
-        st.session_state.group = new_group
-        st.rerun()
+top = st.container(border=True)
+with top:
+    c1, c2, c3, c4 = st.columns([1.1, 1.1, 1.4, 1])
+    with c1:
+        st.session_state.mode = st.radio("交易組別", ["ETF組", "個股組"], horizontal=True)
+    with c2:
+        st.session_state.source_mode = st.selectbox("資料來源", ["AUTO", "TWSE", "TPEx"], index=["AUTO", "TWSE", "TPEx"].index(st.session_state.source_mode))
+    with c3:
+        st.session_state.finmind_token = st.text_input("FinMind Token", type="password", value=st.session_state.finmind_token)
+    with c4:
+        st.session_state.yahoo_debug = st.toggle("Yahoo 除錯面板", value=st.session_state.yahoo_debug)
 
-    st.session_state.source_mode = st.selectbox("資料來源模式", ["AUTO", "TWSE", "TPEx"], index=["AUTO", "TWSE", "TPEx"].index(st.session_state.source_mode))
-    st.session_state.finmind_token = st.text_input("FinMind Token", type="password", value=st.session_state.finmind_token)
-
-    watchlist_text = st.text_input("自選股代號", ",".join(st.session_state.watchlist))
-    watchlist_list = [x.strip().upper() for x in watchlist_text.split(",") if x.strip()]
-    if watchlist_list:
-        st.session_state.watchlist = watchlist_list
-
-    if st.button("更新報價", use_container_width=True):
-        load_market_data()
-        st.success("更新完成")
-        st.rerun()
-
-    st.divider()
-    st.subheader("本機資料庫")
-    conn = get_conn()
-    try:
-        qdf = safe_read_table(conn, "quotes_live", "quote_time")
-        ddf = safe_read_table(conn, "prices_daily", "trade_date")
-        odf = safe_read_table(conn, "orders", "created_at")
-        fdf = safe_read_table(conn, "fills", "filled_at")
-    finally:
-        conn.close()
-
-    st.download_button("匯出即時報價", qdf.to_csv(index=False).encode("utf-8-sig"), "quotes_live.csv", use_container_width=True)
-    st.download_button("匯出盤後資料", ddf.to_csv(index=False).encode("utf-8-sig"), "prices_daily.csv", use_container_width=True)
-    st.download_button("匯出委託單", odf.to_csv(index=False).encode("utf-8-sig"), "orders.csv", use_container_width=True)
-    st.download_button("匯出成交單", fdf.to_csv(index=False).encode("utf-8-sig"), "fills.csv", use_container_width=True)
-
-    st.divider()
-    up_file = st.file_uploader("載入存檔 JSON", type="json")
-    if up_file:
-        data = json.load(up_file)
-        for k, v in data.items():
-            if k in st.session_state:
-                st.session_state[k] = v
-        st.success("讀檔成功")
-
-    st.download_button(
-        "儲存存檔 JSON",
-        data=json.dumps({k: v for k, v in st.session_state.items() if k not in ["market_prices", "daily_quotes"]}, ensure_ascii=False),
-        file_name=f"STP_Save_{datetime.now().strftime('%m%d')}.json",
-        use_container_width=True
-    )
+    w1, w2, w3 = st.columns([1.4, 1, 1])
+    with w1:
+        current_watch = st.session_state.watch_etf if st.session_state.mode == "ETF組" else st.session_state.watch_stock
+        watch_text = st.text_input("自選商品", ",".join(current_watch))
+        parsed = [x.strip().upper() for x in watch_text.split(",") if x.strip()]
+        if parsed:
+            if st.session_state.mode == "ETF組":
+                st.session_state.watch_etf = parsed
+            else:
+                st.session_state.watch_stock = parsed
+    with w2:
+        if st.button("更新商品報價", use_container_width=True):
+            syms = st.session_state.watch_etf + st.session_state.watch_stock
+            live_rows, daily_rows, dividend_rows, debug_logs = market_router(syms)
+            if live_rows:
+                st.session_state.market_prices = {
+                    r["symbol"]: {"price": r["last_price"], "prev_close": r["prev_close"], "source": r["market_source"], "quote_time": r["quote_time"]}
+                    for r in live_rows
+                }
+                upsert_many("quotes_live", live_rows, ["symbol", "quote_time"])
+            if daily_rows:
+                st.session_state.daily_quotes = {r["symbol"]: r for r in daily_rows}
+                upsert_many("prices_daily", daily_rows, ["symbol", "trade_date"])
+            if dividend_rows:
+                st.session_state.dividend_preview = dividend_rows
+                upsert_many("dividend_preview", dividend_rows, ["symbol", "ex_date", "source"])
+            st.session_state.debug_logs = debug_logs
+            st.session_state.last_refresh = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+            st.rerun()
+    with w3:
+        if st.button("重置比賽", use_container_width=True):
+            st.session_state.cash_etf = INITIAL_CAPITAL
+            st.session_state.cash_stock = INITIAL_CAPITAL
+            st.session_state.realized_etf = 0.0
+            st.session_state.realized_stock = 0.0
+            st.session_state.positions_etf = {}
+            st.session_state.positions_stock = {}
+            st.session_state.orders = []
+            st.session_state.trades = []
+            st.session_state.performance = []
+            st.session_state.max_equity = INITIAL_CAPITAL
+            st.success("已重置")
+            st.rerun()
 
 # =========================================================
-# 標題與摘要
+# KPI row
 # =========================================================
-st.title(f"📈 STP 模擬交易平台｜{st.session_state.group}")
+equity = current_equity()
+st.session_state.max_equity = max(st.session_state.max_equity, equity)
+dd = 0 if st.session_state.max_equity <= 0 else (st.session_state.max_equity - equity) / st.session_state.max_equity
+usage = capital_usage()
+sharpe = sharpe_like()
 
-equity = get_equity()
-unrealized = get_unrealized_pnl()
-total_pnl = unrealized + st.session_state.realized_pnl
-total_cost = get_pos_cost()
+k1, k2, k3, k4, k5, k6, k7, k8 = st.columns(8)
+k1.metric("現金剩餘", fmt_money(group_cash()))
+k2.metric("可用資金", fmt_money(group_cash()))
+k3.metric("已實現損益", fmt_money(group_realized()))
+k4.metric("未實現損益", fmt_money(current_unrealized()))
+k5.metric("持股市值", fmt_money(current_positions_value()))
+k6.metric("帳戶總淨值", fmt_money(equity))
+k7.metric("最大回撤", f"{dd:.2%}")
+k8.metric("資金使用率", f"{usage:.2%}")
 
-is_halted = False
-if total_pnl <= -TOTAL_LOSS_LIMIT:
-    st.error("🚨 總虧損已達兩千萬上限，系統暫停交易")
-    is_halted = True
-elif total_pnl <= -PHASE_LOSS_LIMIT:
-    st.warning("🚨 階段虧損已達一千萬，系統暫停交易")
-    is_halted = True
-
-m1, m2, m3, m4 = st.columns(4)
-m1.metric("帳戶總淨值", f"${equity:,.0f}")
-m2.metric("可用現金", f"${st.session_state.cash:,.0f}")
-m3.metric("總損益", f"${total_pnl:,.0f}")
-m4.metric("持股成本", f"${total_cost:,.0f}")
-
-if 0 < total_cost < MIN_PORTFOLIO_COST:
-    st.warning("⚠️ 持股總成本低於兩千萬門檻")
-
-if st.session_state.last_refresh:
-    st.caption(f"最後更新時間：{st.session_state.last_refresh}")
+if current_total_pnl() <= -TOTAL_LOSS_LIMIT:
+    st.error("總虧損已達上限，暫停交易")
+elif current_total_pnl() <= -PHASE_LOSS_LIMIT:
+    st.warning("階段虧損已達上限，請注意風控")
 
 st.markdown("---")
 
 # =========================================================
-# 圖表區
+# Main row
 # =========================================================
-left, right = st.columns([1, 2])
+left, mid, right = st.columns([1.35, 1.15, 1])
 
 with left:
-    st.subheader("資產配置")
-    asset_map = {"現金": st.session_state.cash, "股票": 0, "ETF": 0}
-    for sym, pos in st.session_state.positions.items():
-        cur_price = st.session_state.market_prices.get(sym, {}).get("price", pos["avg_cost"])
-        key = "ETF" if is_etf(sym) else "股票"
-        asset_map[key] += cur_price * pos["qty"]
+    st.markdown('<div class="section-card">', unsafe_allow_html=True)
+    st.subheader("商品報價")
+    wl = watchlist()
+    selected_symbol = st.selectbox("選擇商品", wl if wl else ["0050"], index=0)
+    st.session_state.selected_symbol = selected_symbol
+    q = st.session_state.market_prices.get(selected_symbol, {})
+    a, b, c, d = st.columns(4)
+    a.metric("現價", f"{q.get('price', 0):,.2f}")
+    b.metric("漲跌", f"{q.get('price', 0) - q.get('prev_close', 0):,.2f}")
+    c.metric("漲跌幅", f"{((q.get('price', 0) - q.get('prev_close', 0)) / q.get('prev_close', 1) * 100):,.2f}%")
+    d.metric("來源", q.get("source", "-"))
+    st.caption(f"最後更新：{q.get('quote_time', '-')}")
+    if selected_symbol in st.session_state.daily_quotes:
+        dly = st.session_state.daily_quotes[selected_symbol]
+        fig = go.Figure(data=[go.Candlestick(
+            x=[dly["trade_date"]],
+            open=[dly["open"]],
+            high=[dly["high"]],
+            low=[dly["low"]],
+            close=[dly["close"]]
+        )])
+        fig.update_layout(height=300, margin=dict(t=20, b=20, l=8, r=8))
+        st.plotly_chart(fig, use_container_width=True)
+    else:
+        st.info("尚無盤後資料")
+    if st.session_state.yahoo_debug:
+        with st.expander("🧪 Yahoo 除錯面板", expanded=False):
+            if st.session_state.debug_logs:
+                st.dataframe(pd.DataFrame(st.session_state.debug_logs), use_container_width=True, hide_index=True)
+            else:
+                st.caption("尚未產生除錯資料")
+    st.markdown('</div>', unsafe_allow_html=True)
 
-    pie = px.pie(names=list(asset_map.keys()), values=list(asset_map.values()), hole=0.45)
-    pie.update_layout(height=300, margin=dict(t=10, b=10, l=10, r=10))
-    st.plotly_chart(pie, use_container_width=True)
+with mid:
+    st.markdown('<div class="section-card">', unsafe_allow_html=True)
+    st.subheader("下單")
+    with st.form("order_form", clear_on_submit=False):
+        symbol = st.text_input("股票代號 / ETF 代號", value=st.session_state.selected_symbol).strip().upper()
+        side = st.radio("方向", ["買入", "賣出"], horizontal=True)
+        order_type = st.radio("委託", ["市價", "限價"], horizontal=True)
+        ref = st.session_state.market_prices.get(symbol, {})
+        default_price = ref.get("price", 0.0)
+        price = st.number_input("委託價格", min_value=0.0, value=float(default_price), step=0.01)
+        qty = st.number_input("數量", min_value=1, value=1000, step=1000)
+        reason = st.text_area("下單理由")
+        c1, c2 = st.columns(2)
+        buy_btn = c1.form_submit_button("▲ 買入", use_container_width=True)
+        sell_btn = c2.form_submit_button("▼ 賣出", use_container_width=True)
+        if buy_btn or sell_btn:
+            if not symbol:
+                st.error("請輸入標的")
+            elif not reason:
+                st.error("請填寫理由")
+            else:
+                valid = (st.session_state.mode == "ETF組" and is_etf(symbol)) or (st.session_state.mode == "個股組" and not is_etf(symbol))
+                if not valid:
+                    st.error("標的不符合目前組別")
+                else:
+                    if order_type == "市價":
+                        price = default_price if default_price > 0 else price
+                    ok, msg, oid = save_trade("買入" if buy_btn else "賣出", symbol, float(price), int(qty), reason, order_type)
+                    if ok:
+                        st.success(f"{msg}，委託單號：{oid}")
+                        st.rerun()
+                    else:
+                        st.error(msg)
+    st.markdown('</div>', unsafe_allow_html=True)
 
 with right:
-    st.subheader("淨值走勢")
-    if st.button("記錄今日績效", use_container_width=True):
-        today = datetime.now().strftime("%m/%d")
-        st.session_state.daily_history = [x for x in st.session_state.daily_history if x["日期"] != today]
-        st.session_state.daily_history.append({
-            "日期": today,
-            "投資總成本": total_cost,
-            "投資總市值": equity - st.session_state.cash,
-            "未實現損益": unrealized,
-            "已實現損益": st.session_state.realized_pnl,
-            "損益合計": total_pnl,
-            "帳戶總淨值": equity
-        })
-        st.success("已記錄")
-        st.rerun()
-
-    if st.session_state.daily_history:
-        hd = pd.DataFrame(st.session_state.daily_history)
-        line = px.line(hd, x="日期", y="帳戶總淨值", markers=True)
-        line.update_layout(height=280, margin=dict(t=10, b=10, l=10, r=10))
-        st.plotly_chart(line, use_container_width=True)
-
-st.markdown("---")
-
-# =========================================================
-# 主要介面
-# =========================================================
-tab1, tab2, tab3, tab4 = st.tabs(["交易終端", "持股與委託", "交易紀錄", "排行榜"])
-
-# ---------------------------------------------------------
-# 交易終端
-# ---------------------------------------------------------
-with tab1:
-    col_a, col_b = st.columns([1, 2])
-
-    with col_a:
-        st.subheader("下單區")
-        if is_halted:
-            st.error("系統目前暫停交易")
-        else:
-            with st.form("order_form", clear_on_submit=True):
-                symbol = st.text_input("股票代號").strip().upper()
-                info = st.session_state.market_prices.get(symbol, {})
-                ref_price = info.get("price", 0.0)
-
-                st.caption(f"參考價：{ref_price}")
-                side = st.radio("買賣方向", ["買進", "賣出"], horizontal=True)
-                order_type = st.radio("委託方式", ["限價單", "市價單"], horizontal=True)
-                price = st.number_input("委託價格", min_value=0.0, value=float(ref_price), step=0.01)
-                qty = st.number_input("股數", min_value=1, value=1000, step=1000)
-                reason = st.text_area("交易理由")
-                submit = st.form_submit_button("送出委託", use_container_width=True)
-
-                if submit:
-                    if not symbol:
-                        st.error("請輸入股票代號")
-                    elif not reason:
-                        st.error("請填寫交易理由")
-                    else:
-                        is_valid_group = (st.session_state.group == "ETF投資組" and is_etf(symbol)) or (st.session_state.group == "股票投資組" and not is_etf(symbol))
-                        if not is_valid_group:
-                            st.error("標的不符合目前組別")
-                        else:
-                            if order_type == "市價單":
-                                price = ref_price if ref_price > 0 else price
-                            order = {
-                                "created_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-                                "symbol": symbol,
-                                "symbol_name": symbol,
-                                "side": side,
-                                "order_type": order_type,
-                                "price": price,
-                                "qty": int(qty),
-                                "status": "已送出",
-                                "reason": reason,
-                                "filled_qty": 0,
-                                "remaining_qty": int(qty),
-                                "avg_fill_price": 0.0
-                            }
-                            conn = get_conn()
-                            cur = conn.cursor()
-                            cur.execute("""
-                                INSERT INTO orders (created_at, symbol, symbol_name, side, order_type, price, qty, status, reason, filled_qty, remaining_qty, avg_fill_price)
-                                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                            """, (
-                                order["created_at"], order["symbol"], order["symbol_name"], order["side"], order["order_type"],
-                                order["price"], order["qty"], order["status"], order["reason"], 0, int(qty), 0.0
-                            ))
-                            order_id = cur.lastrowid
-                            conn.commit()
-                            conn.close()
-
-                            st.session_state.orders.append({**order, "order_id": order_id})
-                            st.success(f"委託已送出，委託單號：{order_id}")
-
-    with col_b:
-        st.subheader("五檔 / 圖表 / 即時報價")
-        if st.session_state.watchlist:
-            selected = st.selectbox("選擇標的", st.session_state.watchlist, index=max(0, st.session_state.watchlist.index(st.session_state.selected_symbol)) if st.session_state.selected_symbol in st.session_state.watchlist else 0)
-            st.session_state.selected_symbol = selected
-        else:
-            selected = st.text_input("選擇標的", st.session_state.selected_symbol).strip().upper()
-            st.session_state.selected_symbol = selected
-
-        q = st.session_state.market_prices.get(selected, {})
-        c1, c2, c3, c4 = st.columns(4)
-        c1.metric("現價", f"{q.get('price', 0):,.2f}")
-        c2.metric("漲跌", f"{q.get('price', 0) - q.get('prev_close', 0):,.2f}")
-        c3.metric("漲跌幅", f"{((q.get('price', 0) - q.get('prev_close', 0)) / q.get('prev_close', 1) * 100):,.2f}%")
-        c4.metric("來源", q.get("source", "-"))
-
-        if selected in st.session_state.daily_quotes:
-            d = st.session_state.daily_quotes[selected]
-            fig = go.Figure()
-            fig.add_trace(go.Candlestick(
-                x=[d["trade_date"]],
-                open=[d["open"]],
-                high=[d["high"]],
-                low=[d["low"]],
-                close=[d["close"]],
-                name="日K"
-            ))
-            fig.update_layout(height=420, margin=dict(t=20, b=20, l=10, r=10))
-            st.plotly_chart(fig, use_container_width=True)
-        else:
-            st.info("尚無盤後資料，先更新資料或輸入 FinMind Token")
-
-        if st.session_state.show_five_level:
-            st.subheader("五檔模擬")
-            bid_prices = []
-            ask_prices = []
-            base = q.get("price", 0) or 100
-            for i in range(5):
-                bid_prices.append(round(base * (1 - 0.001 * (i + 1)), 2))
-                ask_prices.append(round(base * (1 + 0.001 * (i + 1)), 2))
-            five_df = pd.DataFrame({
-                "買價": bid_prices,
-                "買量": [1000 * (5 - i) for i in range(5)],
-                "賣價": ask_prices,
-                "賣量": [1000 * (i + 1) for i in range(5)],
-            })
-            st.dataframe(five_df, use_container_width=True, hide_index=True)
-
-# ---------------------------------------------------------
-# 持股與委託
-# ---------------------------------------------------------
-with tab2:
-    pcol, ocol = st.columns([1.2, 1])
-
-    with pcol:
-        st.subheader("持股庫存")
-        if st.session_state.positions:
-            rows = []
-            for sym, pos in st.session_state.positions.items():
-                cur = st.session_state.market_prices.get(sym, {})
-                cur_price = cur.get("price", pos["avg_cost"])
-                cost = pos["avg_cost"] * pos["qty"]
-                value = cur_price * pos["qty"]
-                pnl = value - cost
-                rtn = (cur_price / pos["avg_cost"] - 1) if pos["avg_cost"] > 0 else 0
-                rows.append({
-                    "股票代號": sym,
-                    "股票名稱": cur.get("name", ""),
-                    "持股股數": pos["qty"],
-                    "平均成本": round(pos["avg_cost"], 2),
-                    "現價": round(cur_price, 2),
-                    "持股成本": round(cost),
-                    "持股市值": round(value),
-                    "未實現損益": round(pnl),
-                    "報酬率": f"{rtn:.2%}"
-                })
-            st.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True)
-        else:
-            st.info("目前沒有持股")
-
-    with ocol:
-        st.subheader("委託單")
-        conn = get_conn()
-        try:
-            odf = safe_read_table(conn, "orders", "created_at")
-        finally:
-            conn.close()
-
-        if not odf.empty:
-            st.dataframe(odf, use_container_width=True, hide_index=True)
-        else:
-            st.info("目前沒有委託單")
-
-# ---------------------------------------------------------
-# 交易紀錄
-# ---------------------------------------------------------
-with tab3:
-    st.subheader("成交紀錄")
-    conn = get_conn()
-    try:
-        fdf = safe_read_table(conn, "fills", "filled_at")
-    finally:
-        conn.close()
-
-    if not fdf.empty:
-        st.dataframe(fdf, use_container_width=True, hide_index=True)
-    else:
-        st.info("目前沒有成交紀錄")
-
-    if st.session_state.daily_history:
-        st.subheader("每日績效")
-        hist_df = pd.DataFrame(st.session_state.daily_history)
-        st.dataframe(hist_df, use_container_width=True, hide_index=True)
-
-# ---------------------------------------------------------
-# 排行榜
-# ---------------------------------------------------------
-with tab4:
-    st.subheader("績效排行榜")
-    conn = get_conn()
-    try:
-        ldf = safe_read_table(conn, "leaderboard_snapshots", "snapshot_date")
-    finally:
-        conn.close()
-
-    if not ldf.empty:
-        st.dataframe(ldf, use_container_width=True, hide_index=True)
-    else:
-        st.info("尚未建立排行榜資料")
-
+    st.markdown('<div class="section-card">', unsafe_allow_html=True)
+    st.subheader("風控上限設定")
+    st.write(f"交易成本彙總：{fmt_money(current_positions_value())}")
+    st.write(f"交易成本佔可用資金：{0 if group_cash() == 0 else current_positions_value() / group_cash():.3%}")
+    st.write(f"回撤使用率：{dd:.2%} / {DRAWDOWN_LIMIT:.0%}")
+    st.write(f"夏普值：{sharpe:.2f}")
     if st.button("建立今日績效快照", use_container_width=True):
-        eq = get_equity()
-        pnl = eq - INITIAL_CAPITAL
-        ret = pnl / INITIAL_CAPITAL
         conn = get_conn()
         cur = conn.cursor()
         cur.execute("""
-            INSERT INTO leaderboard_snapshots (snapshot_date, group_name, cash, equity, pnl, return_pct)
-            VALUES (?, ?, ?, ?, ?, ?)
+            INSERT INTO leaderboard
+            (snapshot_date, group_name, cash, equity, pnl, return_pct, drawdown, capital_usage, sharpe)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
         """, (
             datetime.now().strftime("%Y-%m-%d"),
-            st.session_state.group,
-            st.session_state.cash,
-            eq,
-            pnl,
-            ret
+            st.session_state.mode,
+            group_cash(),
+            equity,
+            current_total_pnl(),
+            0 if INITIAL_CAPITAL == 0 else current_total_pnl() / INITIAL_CAPITAL,
+            dd,
+            usage,
+            sharpe
         ))
         conn.commit()
         conn.close()
         st.success("已建立快照")
         st.rerun()
+    st.markdown('</div>', unsafe_allow_html=True)
 
-# =========================================================
-# 底部功能
-# =========================================================
 st.markdown("---")
-a, b, c = st.columns(3)
 
-with a:
+# =========================================================
+# Reports
+# =========================================================
+r1, r2 = st.columns([1.25, 1])
+
+with r1:
+    st.subheader("買賣日報表")
+    if st.session_state.trades:
+        st.dataframe(pd.DataFrame(st.session_state.trades), use_container_width=True, hide_index=True)
+    else:
+        st.info("目前無成交紀錄")
+
+    st.subheader("績效表")
+    perf_data = st.session_state.performance[:]
+    perf_data.append({
+        "日期": datetime.now().strftime("%m/%d"),
+        "組別": st.session_state.mode,
+        "投資總成本": current_positions_value(),
+        "投資總市值": current_positions_value(),
+        "未實現損益": current_unrealized(),
+        "已實現損益": group_realized(),
+        "損益合計": current_total_pnl(),
+        "帳戶總淨值": equity,
+        "最大回撤": dd,
+        "資金使用率": usage,
+        "夏普值": sharpe
+    })
+    st.dataframe(pd.DataFrame(perf_data), use_container_width=True, hide_index=True)
+
+with r2:
+    st.subheader("除權息預告表")
+    if st.session_state.dividend_preview:
+        st.dataframe(pd.DataFrame(st.session_state.dividend_preview), use_container_width=True, hide_index=True)
+    else:
+        st.info("目前無未來除權息資料")
+
+    st.subheader("庫存資料")
+    pos = group_positions()
+    if pos:
+        rows = []
+        for sym, p in pos.items():
+            cur = st.session_state.market_prices.get(sym, {})
+            now_px = cur.get("price", p["avg_cost"])
+            cost = p["avg_cost"] * p["qty"]
+            value = now_px * p["qty"]
+            pnl = value - cost
+            rtn = 0 if cost == 0 else pnl / cost
+            rows.append({
+                "代號": sym,
+                "類別": p.get("type", "股票"),
+                "股數": p["qty"],
+                "平均成本": round(p["avg_cost"], 2),
+                "現價": round(now_px, 2),
+                "持股成本": round(cost),
+                "持股市值": round(value),
+                "未實現損益": round(pnl),
+                "報酬率": f"{rtn:.2%}"
+            })
+        st.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True)
+    else:
+        st.info("目前無持股")
+
+st.markdown("---")
+
+# =========================================================
+# Export + NAV
+# =========================================================
+ex1, ex2, ex3 = st.columns(3)
+with ex1:
+    conn = get_conn()
+    try:
+        qdf = safe_read_table(conn, "quotes_live", "quote_time")
+    finally:
+        conn.close()
+    st.download_button("匯出商品報價 CSV", qdf.to_csv(index=False).encode("utf-8-sig"), "quotes_live.csv", use_container_width=True)
+with ex2:
+    conn = get_conn()
+    try:
+        odf = safe_read_table(conn, "orders", "created_at")
+    finally:
+        conn.close()
+    st.download_button("匯出委託單 CSV", odf.to_csv(index=False).encode("utf-8-sig"), "orders.csv", use_container_width=True)
+with ex3:
+    conn = get_conn()
+    try:
+        fdf = safe_read_table(conn, "fills", "filled_at")
+    finally:
+        conn.close()
+    st.download_button("匯出成交單 CSV", fdf.to_csv(index=False).encode("utf-8-sig"), "fills.csv", use_container_width=True)
+
+st.subheader("NAV 走勢")
+nav_rows = st.session_state.performance[:]
+nav_rows.append({"日期": datetime.now().strftime("%m/%d"), "帳戶總淨值": equity})
+nav_df = pd.DataFrame(nav_rows)
+if not nav_df.empty:
+    fig_nav = px.line(nav_df, x="日期", y="帳戶總淨值", markers=True)
+    fig_nav.update_layout(height=260, margin=dict(t=10, b=10, l=10, r=10))
+    st.plotly_chart(fig_nav, use_container_width=True)
+else:
+    st.caption("尚未設定交易期間")
+
+st.markdown("---")
+
+# =========================================================
+# Bottom actions
+# =========================================================
+b1, b2, b3 = st.columns(3)
+with b1:
     if st.button("重新整理畫面", use_container_width=True):
         st.rerun()
-
-with b:
+with b2:
     if st.button("手動更新資料", use_container_width=True):
-        load_market_data()
+        syms = st.session_state.watch_etf + st.session_state.watch_stock
+        live_rows, daily_rows, dividend_rows, debug_logs = market_router(syms)
+        if live_rows:
+            st.session_state.market_prices = {
+                r["symbol"]: {"price": r["last_price"], "prev_close": r["prev_close"], "source": r["market_source"], "quote_time": r["quote_time"]}
+                for r in live_rows
+            }
+            upsert_many("quotes_live", live_rows, ["symbol", "quote_time"])
+        if daily_rows:
+            st.session_state.daily_quotes = {r["symbol"]: r for r in daily_rows}
+            upsert_many("prices_daily", daily_rows, ["symbol", "trade_date"])
+        if dividend_rows:
+            st.session_state.dividend_preview = dividend_rows
+            upsert_many("dividend_preview", dividend_rows, ["symbol", "ex_date", "source"])
+        st.session_state.debug_logs = debug_logs
+        st.session_state.last_refresh = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         st.success("更新完成")
         st.rerun()
-
-with c:
-    if st.button("清空示範資料", use_container_width=True):
-        st.session_state.positions = {}
-        st.session_state.orders = []
-        st.session_state.fills = []
-        st.session_state.daily_history = []
-        st.session_state.realized_pnl = 0
-        st.session_state.cash = INITIAL_CAPITAL
-        st.success("已清空")
-        st.rerun()
+with b3:
+    if st.button("查看規則說明", use_container_width=True):
+        st.info("ETF組 / 個股組分開記帳；買賣日報表、績效表、庫存、風控與 NAV 走勢皆為本機 SQLite 保存。")
