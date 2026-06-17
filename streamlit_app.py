@@ -3,8 +3,8 @@ import pandas as pd
 import requests
 import sqlite3
 import json
-import os
 import time as time_module
+from pathlib import Path
 from datetime import datetime, time, timedelta
 import plotly.express as px
 import plotly.graph_objects as go
@@ -12,18 +12,12 @@ import urllib3
 
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
-# =========================================================
-# 1) Page config
-# =========================================================
 st.set_page_config(
     page_title="STP 操盤模擬平台 | Royal Life",
     layout="wide",
     initial_sidebar_state="collapsed"
 )
 
-# =========================================================
-# 2) Constants
-# =========================================================
 INITIAL_CAPITAL = 200000000
 COST_LIMIT_PER_TICKER = 40000000
 MIN_PORTFOLIO_COST = 20000000
@@ -31,23 +25,16 @@ FEE_RATE = 0.0004
 TOTAL_LOSS_LIMIT = 20000000
 PHASE_LOSS_LIMIT = 10000000
 
-DB_PATH = "stp_local.db"
-
-SOURCE_MODE = "AUTO"
+BASE_DIR = Path(__file__).resolve().parent
+DB_PATH = str(BASE_DIR / "stp_local.db")
 
 TWSE_LIVE_URL = "https://openapi.twse.com.tw/api/v2/RealTimeQuote"
 TWSE_DAILY_URL = "https://openapi.twse.com.tw/v1/exchangeReport/STOCK_DAY_ALL"
 TPEX_LIVE_URL = "https://www.tpex.org.tw/openapi/v1/tpex_mainboard_quotes"
 TPEX_DAILY_URL = "https://www.tpex.org.tw/openapi/v1/tpex_mainboard_quotes"
-MOPS_URL = "https://mops.twse.com.tw/mops/web/index"
-TAIWANSTOCK_URL = "https://www.taiwanstock.online/api-docs.html"
 FINMIND_BASE = "https://api.finmindtrade.com/api/v4/data"
-
 DEFAULT_SYMBOLS = ["2330", "2317", "0050", "0056", "2603", "2881", "6121", "6208"]
 
-# =========================================================
-# 3) Session state
-# =========================================================
 defaults = {
     "group": "股票投資組",
     "cash": INITIAL_CAPITAL,
@@ -62,15 +49,13 @@ defaults = {
     "chip_cache": {},
     "last_refresh": None,
     "selected_symbols": DEFAULT_SYMBOLS[:],
+    "source_mode": "AUTO",
 }
 
 for k, v in defaults.items():
     if k not in st.session_state:
         st.session_state[k] = v
 
-# =========================================================
-# 4) SQLite helpers
-# =========================================================
 def get_conn():
     conn = sqlite3.connect(DB_PATH, check_same_thread=False)
     conn.row_factory = sqlite3.Row
@@ -121,18 +106,24 @@ def init_db():
         UNIQUE(symbol, action_type, announcement_date, effective_date, amount)
     )
     """)
-    cur.execute("""
-    CREATE TABLE IF NOT EXISTS securities (
-        symbol TEXT PRIMARY KEY,
-        name TEXT,
-        market TEXT,
-        type TEXT,
-        sector TEXT,
-        updated_at TEXT
-    )
-    """)
     conn.commit()
     conn.close()
+
+def table_exists(conn, table_name):
+    cur = conn.cursor()
+    cur.execute("SELECT name FROM sqlite_master WHERE type='table' AND name=?", (table_name,))
+    return cur.fetchone() is not None
+
+def safe_read_table(conn, table_name, order_col=None):
+    if not table_exists(conn, table_name):
+        return pd.DataFrame()
+    sql = f"SELECT * FROM {table_name}"
+    if order_col:
+        sql += f" ORDER BY {order_col} DESC"
+    try:
+        return pd.read_sql_query(sql, conn)
+    except Exception:
+        return pd.DataFrame()
 
 def db_upsert_many(table, rows, pk_cols):
     if not rows:
@@ -143,7 +134,6 @@ def db_upsert_many(table, rows, pk_cols):
     placeholders = ", ".join(["?"] * len(cols))
     insert_cols = ", ".join(cols)
     update_cols = ", ".join([f"{c}=excluded.{c}" for c in cols if c not in pk_cols])
-
     sql = f"""
     INSERT INTO {table} ({insert_cols})
     VALUES ({placeholders})
@@ -154,15 +144,6 @@ def db_upsert_many(table, rows, pk_cols):
     conn.commit()
     conn.close()
 
-def db_fetch_df(query, params=()):
-    conn = get_conn()
-    df = pd.read_sql_query(query, conn, params=params)
-    conn.close()
-    return df
-
-# =========================================================
-# 5) Utilities
-# =========================================================
 def safe_float(v, default=0.0):
     try:
         if v in [None, "", "-", "NaN"]:
@@ -179,14 +160,14 @@ def safe_int(v, default=0):
     except:
         return default
 
+def is_etf(symbol):
+    return symbol.startswith("00") or symbol.endswith("B")
+
 def is_twse(symbol):
     return symbol.isdigit() and len(symbol) == 4 and not symbol.startswith(("6", "8", "9"))
 
 def is_tpex(symbol):
     return symbol.isdigit() and (symbol.startswith("6") or symbol.startswith("8") or symbol.startswith("9"))
-
-def is_etf(symbol):
-    return symbol.startswith("00") or symbol.endswith("B")
 
 def request_json(url, params=None, headers=None, timeout=12):
     headers = headers or {"User-Agent": "Mozilla/5.0"}
@@ -194,249 +175,65 @@ def request_json(url, params=None, headers=None, timeout=12):
     r.raise_for_status()
     return r.json()
 
-def fetch_with_fallback(fns):
-    last_err = None
-    for fn in fns:
-        try:
-            data = fn()
-            if data:
-                return data
-        except Exception as e:
-            last_err = str(e)
-    return [], last_err
-
-# =========================================================
-# 6) Source fetchers
-# =========================================================
 @st.cache_data(ttl=15)
 def fetch_twse_live(symbols):
-    data = request_json(TWSE_LIVE_URL)
+    try:
+        data = request_json(TWSE_LIVE_URL, timeout=15)
+    except:
+        return []
     rows = []
     symbol_set = set(symbols)
-    for item in data if isinstance(data, list) else []:
-        sym = str(item.get("Code", "")).strip()
-        if sym not in symbol_set:
-            continue
-        last = safe_float(item.get("Price") or item.get("ClosingPrice"))
-        prev = safe_float(item.get("PreviousClosePrice") or item.get("ReferencePrice"))
-        vol = safe_int(item.get("TodayVolume"))
-        change = last - prev if prev else 0
-        pct = (change / prev * 100) if prev else 0
-        rows.append({
-            "symbol": sym,
-            "last_price": last,
-            "prev_close": prev,
-            "change_val": change,
-            "change_pct": pct,
-            "volume": vol,
-            "quote_time": datetime.now().isoformat(timespec="seconds"),
-            "market_source": "TWSE",
-            "raw_json": json.dumps(item, ensure_ascii=False)
-        })
+    if isinstance(data, list):
+        for item in data:
+            sym = str(item.get("Code", "")).strip()
+            if sym not in symbol_set:
+                continue
+            last = safe_float(item.get("Price") or item.get("ClosingPrice"))
+            prev = safe_float(item.get("PreviousClosePrice") or item.get("ReferencePrice"))
+            vol = safe_int(item.get("TodayVolume"))
+            change = last - prev if prev else 0
+            pct = (change / prev * 100) if prev else 0
+            rows.append({
+                "symbol": sym,
+                "last_price": last,
+                "prev_close": prev,
+                "change_val": change,
+                "change_pct": pct,
+                "volume": vol,
+                "quote_time": datetime.now().isoformat(timespec="seconds"),
+                "market_source": "TWSE",
+                "raw_json": json.dumps(item, ensure_ascii=False),
+            })
     return rows
 
 @st.cache_data(ttl=15)
 def fetch_tpex_live(symbols):
-    data = request_json(TPEX_LIVE_URL)
+    try:
+        data = request_json(TPEX_LIVE_URL, timeout=15)
+    except:
+        return []
     rows = []
     symbol_set = set(symbols)
-    for item in data if isinstance(data, list) else []:
-        sym = str(item.get("SecuritiesCompanyCode", "")).strip()
-        if sym not in symbol_set:
-            continue
-        last = safe_float(item.get("Close"))
-        prev = safe_float(item.get("ReferencePrice") or item.get("PreviousClose"))
-        vol = safe_int(item.get("TradeVolume"))
-        change = last - prev if prev else 0
-        pct = (change / prev * 100) if prev else 0
-        rows.append({
-            "symbol": sym,
-            "last_price": last,
-            "prev_close": prev,
-            "change_val": change,
-            "change_pct": pct,
-            "volume": vol,
-            "quote_time": datetime.now().isoformat(timespec="seconds"),
-            "market_source": "TPEx",
-            "raw_json": json.dumps(item, ensure_ascii=False)
-        })
-    return rows
-
-@st.cache_data(ttl=20)
-def fetch_taiwanstock_live(symbols):
-    try:
-        data = request_json("https://www.taiwanstock.online/api/realtime")
-        rows = []
-        symbol_set = set(symbols)
-        for item in data if isinstance(data, list) else []:
-            sym = str(item.get("symbol", "")).strip()
-            if sym not in symbol_set:
-                continue
-            last = safe_float(item.get("price"))
-            prev = safe_float(item.get("prev_close"))
-            vol = safe_int(item.get("volume"))
-            change = last - prev if prev else 0
-            pct = (change / prev * 100) if prev else 0
-            rows.append({
-                "symbol": sym,
-                "last_price": last,
-                "prev_close": prev,
-                "change_val": change,
-                "change_pct": pct,
-                "volume": vol,
-                "quote_time": datetime.now().isoformat(timespec="seconds"),
-                "market_source": "TaiwanStock",
-                "raw_json": json.dumps(item, ensure_ascii=False)
-            })
-        return rows
-    except:
-        return []
-
-@st.cache_data(ttl=30)
-def fetch_yahoo_live(symbols):
-    rows = []
-    for sym in symbols:
-        try:
-            suffix = ".TW" if is_twse(sym) else ".TWO"
-            url = f"https://query1.finance.yahoo.com/v8/finance/chart/{sym}{suffix}"
-            data = request_json(url, timeout=12)
-            result = data.get("chart", {}).get("result", [None])[0]
-            if not result:
-                continue
-            meta = result.get("meta", {})
-            last = safe_float(meta.get("regularMarketPrice"))
-            prev = safe_float(meta.get("previousClose"))
-            vol = safe_int(meta.get("regularMarketVolume"))
-            change = last - prev if prev else 0
-            pct = (change / prev * 100) if prev else 0
-            rows.append({
-                "symbol": sym,
-                "last_price": last,
-                "prev_close": prev,
-                "change_val": change,
-                "change_pct": pct,
-                "volume": vol,
-                "quote_time": datetime.now().isoformat(timespec="seconds"),
-                "market_source": "Yahoo",
-                "raw_json": json.dumps(data, ensure_ascii=False)
-            })
-        except:
-            pass
-    return rows
-
-@st.cache_data(ttl=60)
-def fetch_yfinance_live(symbols):
-    rows = []
-    for sym in symbols:
-        try:
-            suffix = ".TW" if is_twse(sym) else ".TWO"
-            url = f"https://query1.finance.yahoo.com/v8/finance/chart/{sym}{suffix}"
-            data = request_json(url, timeout=15)
-            result = data.get("chart", {}).get("result", [None])[0]
-            if not result:
-                continue
-            meta = result.get("meta", {})
-            last = safe_float(meta.get("regularMarketPrice"))
-            prev = safe_float(meta.get("previousClose"))
-            vol = safe_int(meta.get("regularMarketVolume"))
-            change = last - prev if prev else 0
-            pct = (change / prev * 100) if prev else 0
-            rows.append({
-                "symbol": sym,
-                "last_price": last,
-                "prev_close": prev,
-                "change_val": change,
-                "change_pct": pct,
-                "volume": vol,
-                "quote_time": datetime.now().isoformat(timespec="seconds"),
-                "market_source": "yfinance",
-                "raw_json": json.dumps(data, ensure_ascii=False)
-            })
-        except:
-            pass
-    return rows
-
-@st.cache_data(ttl=30)
-def fetch_finnhub_live(symbols, api_key):
-    if not api_key:
-        return []
-    rows = []
-    for sym in symbols:
-        try:
-            suffix = ".TW" if is_twse(sym) else ".TWO"
-            url = "https://finnhub.io/api/v1/quote"
-            data = request_json(url, params={"symbol": f"{sym}{suffix}", "token": api_key}, timeout=10)
-            last = safe_float(data.get("c"))
-            prev = safe_float(data.get("pc"))
-            vol = safe_int(data.get("v"))
-            change = last - prev if prev else 0
-            pct = (change / prev * 100) if prev else 0
-            rows.append({
-                "symbol": sym,
-                "last_price": last,
-                "prev_close": prev,
-                "change_val": change,
-                "change_pct": pct,
-                "volume": vol,
-                "quote_time": datetime.now().isoformat(timespec="seconds"),
-                "market_source": "Finnhub",
-                "raw_json": json.dumps(data, ensure_ascii=False)
-            })
-        except:
-            pass
-    return rows
-
-@st.cache_data(ttl=3600)
-def fetch_twse_daily(symbols):
-    try:
-        data = request_json(TWSE_DAILY_URL, timeout=20)
-    except:
-        return []
-    rows = []
-    if isinstance(data, list):
-        for item in data:
-            sym = str(item.get("Code", "")).strip()
-            if sym not in symbols:
-                continue
-            rows.append({
-                "symbol": sym,
-                "trade_date": datetime.now().date().isoformat(),
-                "open": safe_float(item.get("OpeningPrice")),
-                "high": safe_float(item.get("HighestPrice")),
-                "low": safe_float(item.get("LowestPrice")),
-                "close": safe_float(item.get("ClosingPrice")),
-                "volume": safe_int(item.get("TradeVolume")),
-                "adjusted_close": safe_float(item.get("ClosingPrice")),
-                "market_source": "TWSE",
-                "chip_json": None,
-                "raw_json": json.dumps(item, ensure_ascii=False)
-            })
-    return rows
-
-@st.cache_data(ttl=3600)
-def fetch_tpex_daily(symbols):
-    try:
-        data = request_json(TPEX_DAILY_URL, timeout=20)
-    except:
-        return []
-    rows = []
     if isinstance(data, list):
         for item in data:
             sym = str(item.get("SecuritiesCompanyCode", "")).strip()
-            if sym not in symbols:
+            if sym not in symbol_set:
                 continue
+            last = safe_float(item.get("Close"))
+            prev = safe_float(item.get("ReferencePrice") or item.get("PreviousClose"))
+            vol = safe_int(item.get("TradeVolume"))
+            change = last - prev if prev else 0
+            pct = (change / prev * 100) if prev else 0
             rows.append({
                 "symbol": sym,
-                "trade_date": datetime.now().date().isoformat(),
-                "open": safe_float(item.get("Open")),
-                "high": safe_float(item.get("High")),
-                "low": safe_float(item.get("Low")),
-                "close": safe_float(item.get("Close")),
-                "volume": safe_int(item.get("TradeVolume")),
-                "adjusted_close": safe_float(item.get("Close")),
+                "last_price": last,
+                "prev_close": prev,
+                "change_val": change,
+                "change_pct": pct,
+                "volume": vol,
+                "quote_time": datetime.now().isoformat(timespec="seconds"),
                 "market_source": "TPEx",
-                "chip_json": None,
-                "raw_json": json.dumps(item, ensure_ascii=False)
+                "raw_json": json.dumps(item, ensure_ascii=False),
             })
     return rows
 
@@ -445,7 +242,6 @@ def fetch_finmind_daily(symbols, token):
     if not token:
         return []
     rows = []
-    headers = {}
     for sym in symbols:
         try:
             params = {
@@ -453,9 +249,9 @@ def fetch_finmind_daily(symbols, token):
                 "data_id": sym,
                 "start_date": (datetime.now() - timedelta(days=10)).date().isoformat(),
                 "end_date": datetime.now().date().isoformat(),
-                "token": token
+                "token": token,
             }
-            data = request_json(FINMIND_BASE, params=params, headers=headers, timeout=20)
+            data = request_json(FINMIND_BASE, params=params, timeout=20)
             ds = data.get("data", [])
             if not ds:
                 continue
@@ -471,7 +267,7 @@ def fetch_finmind_daily(symbols, token):
                 "adjusted_close": safe_float(latest.get("close")),
                 "market_source": "FinMind",
                 "chip_json": None,
-                "raw_json": json.dumps(latest, ensure_ascii=False)
+                "raw_json": json.dumps(latest, ensure_ascii=False),
             })
         except:
             pass
@@ -489,7 +285,7 @@ def fetch_finmind_chip(symbols, token):
                 "data_id": sym,
                 "start_date": (datetime.now() - timedelta(days=10)).date().isoformat(),
                 "end_date": datetime.now().date().isoformat(),
-                "token": token
+                "token": token,
             }
             data = request_json(FINMIND_BASE, params=params, timeout=20)
             ds = data.get("data", [])
@@ -501,61 +297,44 @@ def fetch_finmind_chip(symbols, token):
 
 @st.cache_data(ttl=86400)
 def fetch_mops_actions(symbols):
-    rows = []
     today = datetime.now().date().isoformat()
-    for sym in symbols:
-        rows.append({
-            "symbol": sym,
-            "action_type": "INFO",
-            "announcement_date": today,
-            "effective_date": today,
-            "amount": None,
-            "raw_json": json.dumps({
-                "note": "MOPS structure placeholder for local test"
-            }, ensure_ascii=False)
-        })
-    return rows
+    return [{
+        "symbol": sym,
+        "action_type": "INFO",
+        "announcement_date": today,
+        "effective_date": today,
+        "amount": None,
+        "raw_json": json.dumps({"note": "MOPS placeholder for local test"}, ensure_ascii=False),
+    } for sym in symbols]
 
-# =========================================================
-# 7) Router
-# =========================================================
-def market_data_router(symbols, finmind_token="", finnhub_key=""):
+def market_data_router(symbols, finmind_token="", source_mode="AUTO"):
     live_rows = []
-    daily_rows = []
-    action_rows = []
-    chip_map = {}
-
-    if SOURCE_MODE == "AUTO":
+    if source_mode == "AUTO":
         live_rows = fetch_twse_live(symbols)
         if not live_rows:
             live_rows = fetch_tpex_live(symbols)
-        if not live_rows:
-            live_rows = fetch_taiwanstock_live(symbols)
-        if not live_rows:
-            live_rows = fetch_yahoo_live(symbols)
-        if not live_rows:
-            live_rows = fetch_yfinance_live(symbols)
-        if not live_rows:
-            live_rows = fetch_finnhub_live(symbols, finnhub_key)
-    elif SOURCE_MODE == "TWSE":
+    elif source_mode == "TWSE":
         live_rows = fetch_twse_live(symbols)
-    elif SOURCE_MODE == "TPEx":
+    elif source_mode == "TPEx":
         live_rows = fetch_tpex_live(symbols)
 
-    daily_rows = fetch_twse_daily(symbols) + fetch_tpex_daily(symbols)
-
-    finmind_rows = fetch_finmind_daily(symbols, finmind_token)
-    if finmind_rows:
-        daily_rows = finmind_rows
-
+    daily_rows = fetch_finmind_daily(symbols, finmind_token)
     chip_map = fetch_finmind_chip(symbols, finmind_token)
     action_rows = fetch_mops_actions(symbols)
-
     return live_rows, daily_rows, action_rows, chip_map
 
-# =========================================================
-# 8) Business logic
-# =========================================================
+def market_price_map(rows):
+    mp = {}
+    for r in rows:
+        mp[r["symbol"]] = {
+            "name": "",
+            "price": r.get("last_price", 0.0),
+            "prev_close": r.get("prev_close", 0.0),
+            "source": r.get("market_source", ""),
+            "quote_time": r.get("quote_time", ""),
+        }
+    return mp
+
 def get_equity():
     stock_val = 0
     for t, p in st.session_state.positions.items():
@@ -570,25 +349,12 @@ def calc_unrealized():
         total += (cur_p - p["avg_cost"]) * p["quantity"]
     return total
 
-def market_price_map(rows):
-    mp = {}
-    for r in rows:
-        mp[r["symbol"]] = {
-            "name": "",
-            "price": r.get("last_price", 0.0),
-            "prev_close": r.get("prev_close", 0.0),
-            "source": r.get("market_source", ""),
-            "quote_time": r.get("quote_time", "")
-        }
-    return mp
-
 def load_market_data():
-    finmind_token = st.secrets.get("FINMIND_TOKEN", "") if hasattr(st, "secrets") else ""
-    finnhub_key = st.secrets.get("FINNHUB_KEY", "") if hasattr(st, "secrets") else ""
+    finmind_token = st.session_state.get("finmind_token", "")
     live_rows, daily_rows, action_rows, chip_map = market_data_router(
         st.session_state.selected_symbols,
         finmind_token=finmind_token,
-        finnhub_key=finnhub_key
+        source_mode=st.session_state.source_mode
     )
 
     if live_rows:
@@ -617,17 +383,19 @@ def show_help_dialog():
 * 持股最低成本限制：**2,000 萬元**。
 
 #### 2. 成交價計價規則
-* **13:30 前**下單：以**當日收盤價**或即時價計算。
-* **13:30 後**下單：以**次日盤後定版價**計算。
+* **13:30 前**下單：以即時價或當日收盤參考價。
+* **13:30 後**下單：以次日盤後定版價。
 
 #### 3. 階段性停損規範
 * 總累積虧損達兩千萬，或階段性虧損達一千萬，強制停止交易。
 * 單一標的損失達 **30%**，須於次日強制出清。
 """)
 
-# =========================================================
-# 9) Sidebar
-# =========================================================
+init_db()
+
+if "finmind_token" not in st.session_state:
+    st.session_state.finmind_token = ""
+
 with st.sidebar:
     st.header("⚙️ 系統管理")
 
@@ -636,11 +404,9 @@ with st.sidebar:
         st.session_state.group = new_group
         st.rerun()
 
-    source_choice = st.selectbox("資料源模式", ["AUTO", "TWSE", "TPEx"])
-    SOURCE_MODE = source_choice
+    st.session_state.source_mode = st.selectbox("資料源模式", ["AUTO", "TWSE", "TPEx"], index=["AUTO", "TWSE", "TPEx"].index(st.session_state.source_mode))
 
-    token_finmind = st.text_input("FinMind Token", type="password")
-    token_finnhub = st.text_input("Finnhub Key", type="password")
+    st.session_state.finmind_token = st.text_input("FinMind Token", type="password", value=st.session_state.finmind_token)
 
     symbols_text = st.text_input("追蹤標的（逗號分隔）", ",".join(st.session_state.selected_symbols))
     parsed_symbols = [s.strip().upper() for s in symbols_text.split(",") if s.strip()]
@@ -648,18 +414,18 @@ with st.sidebar:
         st.session_state.selected_symbols = parsed_symbols
 
     if st.button("🔄 更新資料", use_container_width=True):
-        live_n, daily_n, action_n = load_market_data()
-        st.success(f"更新完成：即時 {live_n} 筆 / 盤後 {daily_n} 筆 / 事件 {action_n} 筆")
+        load_market_data()
+        st.success("更新完成")
         st.rerun()
 
     st.divider()
-
     st.subheader("📥 匯出資料")
+
     conn = get_conn()
     try:
-        qdf = pd.read_sql_query("SELECT * FROM quotes_live ORDER BY quote_time DESC", conn)
-        ddf = pd.read_sql_query("SELECT * FROM prices_daily ORDER BY trade_date DESC", conn)
-        adf = pd.read_sql_query("SELECT * FROM corporate_actions ORDER BY announcement_date DESC", conn)
+        qdf = safe_read_table(conn, "quotes_live", "quote_time")
+        ddf = safe_read_table(conn, "prices_daily", "trade_date")
+        adf = safe_read_table(conn, "corporate_actions", "announcement_date")
     finally:
         conn.close()
 
@@ -683,7 +449,6 @@ with st.sidebar:
     )
 
     st.divider()
-
     up_file = st.file_uploader("📂 載入進度 (.json)", type="json")
     if up_file:
         data = json.load(up_file)
@@ -699,16 +464,9 @@ with st.sidebar:
         use_container_width=True
     )
 
-# =========================================================
-# 10) Init DB and load data
-# =========================================================
-init_db()
 if not st.session_state.market_prices:
     load_market_data()
 
-# =========================================================
-# 11) Dashboard
-# =========================================================
 st.title(f"📈 STP 模擬交易平台 - {st.session_state.group}")
 
 eq = get_equity()
@@ -716,7 +474,6 @@ unrealized = calc_unrealized()
 total_pnl = unrealized + st.session_state.realized_pnl
 total_cost = sum(p["avg_cost"] * p["quantity"] for p in st.session_state.positions.values())
 
-now = datetime.now()
 is_halted = False
 if total_pnl <= -TOTAL_LOSS_LIMIT:
     st.error("🚨 警告：總虧損已達兩千萬上限，依規定強制停止交易！")
@@ -739,9 +496,6 @@ if st.session_state.last_refresh:
 
 st.markdown("---")
 
-# =========================================================
-# 12) Charts
-# =========================================================
 c1, c2 = st.columns([1, 2])
 
 with c1:
@@ -753,14 +507,8 @@ with c1:
         if kind not in val_map:
             val_map[kind] = 0
         val_map[kind] += cur_p * p["quantity"]
-
-    fig = px.pie(
-        names=list(val_map.keys()),
-        values=list(val_map.values()),
-        hole=0.5,
-        color_discrete_sequence=["#4a4e69", "#ef476f", "#06d6a0", "#118ab2"]
-    )
-    fig.update_layout(height=280, margin=dict(t=10, b=10, l=10, r=10), showlegend=True, legend=dict(orientation="h", y=-0.2))
+    fig = px.pie(names=list(val_map.keys()), values=list(val_map.values()), hole=0.5)
+    fig.update_layout(height=280, margin=dict(t=10, b=10, l=10, r=10))
     st.plotly_chart(fig, use_container_width=True)
 
 with c2:
@@ -783,19 +531,15 @@ with c2:
     if st.session_state.daily_equity_history:
         h_df = pd.DataFrame(st.session_state.daily_equity_history)
         fig_l = px.line(h_df, x="日期", y="帳戶總淨值", markers=True, template="plotly_dark")
-        fig_l.update_layout(height=250, margin=dict(t=10, b=10, l=10, r=10), paper_bgcolor="rgba(0,0,0,0)", plot_bgcolor="rgba(0,0,0,0)")
+        fig_l.update_layout(height=250, margin=dict(t=10, b=10, l=10, r=10))
         st.plotly_chart(fig_l, use_container_width=True)
 
 st.markdown("---")
 
-# =========================================================
-# 13) Trading
-# =========================================================
 t_col, l_col = st.columns([1, 2])
 
 with t_col:
     st.subheader("執行下單委託")
-
     if is_halted:
         st.error("系統交易權限已暫鎖")
     else:
@@ -916,15 +660,11 @@ with l_col:
             st.info("目前沒有交易紀錄")
 
     with tab3:
-        if not st.session_state.daily_quotes_cache:
-            st.info("尚未載入盤後資料")
+        if st.session_state.daily_quotes_cache:
+            st.dataframe(pd.DataFrame(list(st.session_state.daily_quotes_cache.values())), use_container_width=True, hide_index=True)
         else:
-            df_daily = pd.DataFrame(list(st.session_state.daily_quotes_cache.values()))
-            st.dataframe(df_daily, use_container_width=True, hide_index=True)
+            st.info("尚未載入盤後資料")
 
-# =========================================================
-# 14) Footer actions
-# =========================================================
 col_a, col_b, col_c = st.columns(3)
 with col_a:
     if st.button("🔁 重新整理畫面", use_container_width=True):
