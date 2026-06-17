@@ -6,6 +6,22 @@ from datetime import datetime, timedelta
 
 # 1. 網頁基本設定
 st.set_page_config(page_title="AI 股票分析儀表板", layout="wide")
+import streamlit as st
+
+st.set_page_config(page_title="專業投資儀表板", layout="wide")
+
+# 隱藏 Streamlit 官方選單與右下角浮水印的 CSS
+hide_style = """
+    <style>
+    #MainMenu {visibility: hidden;}
+    footer {visibility: hidden;}
+    header {visibility: hidden;}
+    .viewerBadge_container__1QS1h {display: none !important;} /* 隱藏 Manage app */
+    stDecoration {display: none !important;}
+    </style>
+"""
+st.markdown(hide_style, unsafe_allow_html=True)
+
 st.title("📈 互動式股票分析與回測工具")
 st.write("這是一個利用 Streamlit 快速建立的股票分析與可視化工具。")
 
