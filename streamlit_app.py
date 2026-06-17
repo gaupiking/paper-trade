@@ -50,20 +50,6 @@ div[data-testid="stDataFrame"] {
     background: linear-gradient(180deg, rgba(17,24,39,0.95), rgba(17,24,39,0.85));
     box-shadow: 0 8px 22px rgba(0,0,0,0.18);
 }
-.small-label {
-    font-size: 0.82rem;
-    color: #9ca3af;
-    margin-bottom: 0.15rem;
-}
-.big-number {
-    font-size: 1.35rem;
-    font-weight: 800;
-    color: #f9fafb;
-}
-.sub-number {
-    font-size: 0.92rem;
-    color: #d1d5db;
-}
 hr { margin: 0.6rem 0 0.9rem 0; }
 </style>
 """, unsafe_allow_html=True)
@@ -78,7 +64,6 @@ INITIAL_CAPITAL = 200000000
 FEE_RATE = 0.0004
 TAX_STOCK = 0.003
 TAX_ETF = 0.001
-COST_LIMIT_PER_GROUP = 40000000
 TOTAL_LOSS_LIMIT = 20000000
 PHASE_LOSS_LIMIT = 10000000
 DRAWDOWN_LIMIT = 0.10
@@ -260,6 +245,31 @@ def upsert_many(table, rows, pk_cols):
     conn.commit()
     conn.close()
 
+def save_dividend_preview(rows):
+    if not rows:
+        return
+    conn = get_conn()
+    cur = conn.cursor()
+    cur.execute("DELETE FROM dividend_preview")
+    cur.executemany("""
+        INSERT INTO dividend_preview
+        (symbol, symbol_name, ex_date, cash_dividend, stock_dividend, source, raw_json)
+        VALUES (?, ?, ?, ?, ?, ?, ?)
+    """, [
+        (
+            r.get("symbol", ""),
+            r.get("symbol_name", ""),
+            r.get("ex_date", ""),
+            r.get("cash_dividend", 0.0),
+            r.get("stock_dividend", 0.0),
+            r.get("source", ""),
+            r.get("raw_json", "")
+        )
+        for r in rows
+    ])
+    conn.commit()
+    conn.close()
+
 # =========================================================
 # Utils
 # =========================================================
@@ -395,10 +405,15 @@ def fetch_twse_live(symbols):
             chg = last - prev if prev else 0
             pct = (chg / prev * 100) if prev else 0
             rows.append({
-                "symbol": sym, "last_price": last, "prev_close": prev,
-                "change_val": chg, "change_pct": pct, "volume": vol,
+                "symbol": sym,
+                "last_price": last,
+                "prev_close": prev,
+                "change_val": chg,
+                "change_pct": pct,
+                "volume": vol,
                 "quote_time": datetime.now().isoformat(timespec="seconds"),
-                "market_source": "TWSE", "raw_json": json.dumps(item, ensure_ascii=False)
+                "market_source": "TWSE",
+                "raw_json": json.dumps(item, ensure_ascii=False)
             })
     return rows
 
@@ -421,10 +436,15 @@ def fetch_tpex_live(symbols):
             chg = last - prev if prev else 0
             pct = (chg / prev * 100) if prev else 0
             rows.append({
-                "symbol": sym, "last_price": last, "prev_close": prev,
-                "change_val": chg, "change_pct": pct, "volume": vol,
+                "symbol": sym,
+                "last_price": last,
+                "prev_close": prev,
+                "change_val": chg,
+                "change_pct": pct,
+                "volume": vol,
                 "quote_time": datetime.now().isoformat(timespec="seconds"),
-                "market_source": "TPEx", "raw_json": json.dumps(item, ensure_ascii=False)
+                "market_source": "TPEx",
+                "raw_json": json.dumps(item, ensure_ascii=False)
             })
     return rows
 
@@ -447,10 +467,15 @@ def fetch_yahoo_debug(symbols):
             chg = last - prev if prev else 0
             pct = (chg / prev * 100) if prev else 0
             rows.append({
-                "symbol": sym, "last_price": last, "prev_close": prev,
-                "change_val": chg, "change_pct": pct, "volume": vol,
+                "symbol": sym,
+                "last_price": last,
+                "prev_close": prev,
+                "change_val": chg,
+                "change_pct": pct,
+                "volume": vol,
                 "quote_time": datetime.now().isoformat(timespec="seconds"),
-                "market_source": "Yahoo", "raw_json": json.dumps(data, ensure_ascii=False)
+                "market_source": "Yahoo",
+                "raw_json": json.dumps(data, ensure_ascii=False)
             })
             logs.append({"股票代號": sym, "狀態": "成功", "訊息": f"價格={last}"})
         except Exception as e:
@@ -527,6 +552,9 @@ def market_router(symbols):
     dividend_rows = fetch_dividend_preview(symbols)
     return live_rows, daily_rows, dividend_rows, debug_logs
 
+# =========================================================
+# Trade
+# =========================================================
 def save_trade(side, symbol, price, qty, reason, order_type):
     now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     fee = round(price * qty * FEE_RATE)
@@ -591,12 +619,17 @@ def save_trade(side, symbol, price, qty, reason, order_type):
 # Init
 # =========================================================
 init_db()
+
 if not st.session_state.market_prices:
     live_rows, daily_rows, dividend_rows, debug_logs = market_router(st.session_state.watch_etf + st.session_state.watch_stock)
     if live_rows:
         st.session_state.market_prices = {
-            r["symbol"]: {"price": r["last_price"], "prev_close": r["prev_close"], "source": r["market_source"], "quote_time": r["quote_time"]}
-            for r in live_rows
+            r["symbol"]: {
+                "price": r["last_price"],
+                "prev_close": r["prev_close"],
+                "source": r["market_source"],
+                "quote_time": r["quote_time"]
+            } for r in live_rows
         }
         upsert_many("quotes_live", live_rows, ["symbol", "quote_time"])
     if daily_rows:
@@ -604,7 +637,7 @@ if not st.session_state.market_prices:
         upsert_many("prices_daily", daily_rows, ["symbol", "trade_date"])
     if dividend_rows:
         st.session_state.dividend_preview = dividend_rows
-        upsert_many("dividend_preview", dividend_rows, ["symbol", "ex_date", "source"])
+        save_dividend_preview(dividend_rows)
     st.session_state.debug_logs = debug_logs
 
 # =========================================================
@@ -649,7 +682,7 @@ with top:
                 upsert_many("prices_daily", daily_rows, ["symbol", "trade_date"])
             if dividend_rows:
                 st.session_state.dividend_preview = dividend_rows
-                upsert_many("dividend_preview", dividend_rows, ["symbol", "ex_date", "source"])
+                save_dividend_preview(dividend_rows)
             st.session_state.debug_logs = debug_logs
             st.session_state.last_refresh = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
             st.rerun()
@@ -669,7 +702,7 @@ with top:
             st.rerun()
 
 # =========================================================
-# KPI row
+# KPI
 # =========================================================
 equity = current_equity()
 st.session_state.max_equity = max(st.session_state.max_equity, equity)
@@ -695,7 +728,7 @@ elif current_total_pnl() <= -PHASE_LOSS_LIMIT:
 st.markdown("---")
 
 # =========================================================
-# Main row
+# Main
 # =========================================================
 left, mid, right = st.columns([1.35, 1.15, 1])
 
@@ -926,7 +959,7 @@ with b2:
             upsert_many("prices_daily", daily_rows, ["symbol", "trade_date"])
         if dividend_rows:
             st.session_state.dividend_preview = dividend_rows
-            upsert_many("dividend_preview", dividend_rows, ["symbol", "ex_date", "source"])
+            save_dividend_preview(dividend_rows)
         st.session_state.debug_logs = debug_logs
         st.session_state.last_refresh = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         st.success("更新完成")
