@@ -1,74 +1,134 @@
-import requests
-import json
+import streamlit as st
+import pandas as pd
+import time
+from playwright.sync_api import sync_playwright
 
-SUPABASE_URL = "https://murynwlbdgxkimfgunfx.supabase.co"
-ANON_KEY = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6Im11cnlud2xiZGd4a2ltZmd1bmZ4Iiwicm9sZSI6ImFub24iLCJpYXQiOjE3Nzk4Mzc4MDAsImV4cCI6MjA5NTQxMzgwMH0.Zhz9S4wUEaoQhMNke_EPoGqfdw21yvshNBFx4GUNfuI"
+# --- 網頁基本設定 ---
+st.set_page_config(page_title="1688 快速比價系統", page_icon="🛒", layout="wide")
 
-HEADERS = {
-    "Authorization": f"Bearer {ANON_KEY}",
-    "Content-Type": "application/json"
-}
+def scrape_1688_data(keyword, max_items=10):
+    """
+    使用 Playwright 同步抓取 1688 資料
+    """
+    results = []
+    
+    # 啟動 Playwright
+    with sync_playwright() as p:
+        # headless=False 讓你可以看到真實瀏覽器，如果遇到滑塊或登入可以手動處理
+        browser = p.chromium.launch(headless=False)
+        context = browser.new_context(
+            user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+        )
+        page = context.new_page()
+        
+        try:
+            url = f"https://s.1688.com/selloffer/offer_search.htm?keywords={keyword}"
+            page.goto(url, wait_until="domcontentloaded")
+            
+            # 給予足夠的時間讓 JavaScript 渲染，或讓你手動處理驗證碼
+            time.sleep(5) 
+            
+            # 抓取商品卡片
+            products = page.query_selector_all('.sm-offer-item')
+            
+            if not products:
+                st.error("⚠️ 找不到商品，可能觸發了登入牆或滑塊驗證！請在彈出的瀏覽器中手動處理後再試。")
+                return []
 
-def call_router(payload: dict) -> dict:
-    resp = requests.post(
-        f"{SUPABASE_URL}/functions/v1/quote-router-v9",
-        headers=HEADERS,
-        json=payload,
-        timeout=30
-    )
-    return resp.json()
+            for i, product in enumerate(products[:max_items]):
+                # 抓取標題
+                title_el = product.query_selector('.sm-offer-title')
+                title = title_el.inner_text().strip() if title_el else "無標題"
+                
+                # 抓取價格 (並過濾掉 '¥' 符號轉為浮點數方便比價)
+                price_el = product.query_selector('.sm-offer-priceNum')
+                price_str = price_el.inner_text().replace('¥', '').strip() if price_el else "0"
+                try:
+                    price = float(price_str)
+                except ValueError:
+                    price = 0.0
+                
+                # 抓取公司名稱
+                company_el = product.query_selector('.sm-offer-companyName')
+                company = company_el.inner_text().strip() if company_el else "無公司名稱"
+                
+                # 抓取商品連結
+                link_el = product.query_selector('a.sm-offer-photoLink')
+                link = link_el.get_attribute('href') if link_el else ""
+                if link and not link.startswith('http'):
+                    link = "https:" + link
 
-def validate_result(symbol: str, data: dict):
-    errors = []
+                results.append({
+                    "商品名稱": title,
+                    "價格 (RMB)": price,
+                    "供應商": company,
+                    "商品連結": link
+                })
+                
+        except Exception as e:
+            st.error(f"抓取過程中發生錯誤: {e}")
+        finally:
+            browser.close()
+            
+    return results
 
-    # 1. 必填欄位
-    required_fields = ["symbol", "last_price", "prev_close", "status", "data_freshness", "source_key"]
-    for f in required_fields:
-        if f not in data:
-            errors.append(f"缺少欄位: {f}")
+# --- Streamlit UI 介面 ---
+st.title("🛒 1688 快速比價與資料抓取系統")
+st.markdown("輸入關鍵字後，系統將呼叫本地瀏覽器抓取最新商品資訊，並自動進行價格排序。")
 
-    # 2. 非開盤時間 → 應為 daily 模式
-    freshness = data.get("data_freshness", "")
-    if freshness not in ("daily", "delayed_20m+"):
-        errors.append(f"非交易時段但 data_freshness={freshness}，預期 daily")
+st.divider()
 
-    # 3. 價格合理性（台股一般 1~10000 元）
-    price = data.get("last_price")
-    if price is not None and not (1 <= price <= 10000):
-        errors.append(f"價格異常: {price}")
+# 側邊欄：搜尋條件設定
+with st.sidebar:
+    st.header("🔍 搜尋設定")
+    keyword = st.text_input("搜尋關鍵字", value="保溫杯")
+    max_items = st.slider("最大抓取數量", min_value=5, max_value=40, value=15, step=5)
+    start_search = st.button("開始抓取與比價", type="primary")
 
-    # 4. 漲跌幅合理性（漲跌停 ±10%，留些容錯空間）
-    change_pct = data.get("change_pct")
-    if change_pct is not None and abs(change_pct) > 15:
-        errors.append(f"漲跌幅異常: {change_pct}%")
-
-    # 5. status 應為 ok 或 ok_fallback
-    status = data.get("status", "")
-    if not status.startswith("ok"):
-        errors.append(f"status 非預期: {status}")
-
-    if errors:
-        print(f"  ❌ {symbol}: {errors}")
+# 主畫面：顯示結果
+if start_search:
+    if not keyword:
+        st.warning("請輸入搜尋關鍵字！")
     else:
-        print(f"  ✅ {symbol}: price={price}, freshness={freshness}, source={data.get('source_key')}")
-
-# ─── 測試案例 ───────────────────────────────────
-TEST_CASES = [
-    # (說明, payload)
-    ("一般測試 auto 模式",         {"symbols": ["2330", "2454", "0050"]}),
-    ("強制 daily 模式",            {"symbols": ["2330"], "mode": "daily"}),
-    ("強制 realtime（預期 fallback）", {"symbols": ["2330"], "mode": "realtime"}),
-    ("上櫃股票",                   {"symbols": ["6547"]}),
-    ("ETF",                        {"symbols": ["00878", "00720B"]}),
-    ("空請求（預設清單）",          {}),
-]
-
-for desc, payload in TEST_CASES:
-    print(f"\n【{desc}】")
-    result = call_router(payload)
-
-    # result 可能是 list 或 dict
-    items = result if isinstance(result, list) else result.get("data", [result])
-    for item in items:
-        sym = item.get("symbol", "?")
-        validate_result(sym, item)
+        with st.spinner(f"正在啟動瀏覽器前往 1688 搜尋「{keyword}」... 請不要關閉彈出的瀏覽器視窗！"):
+            data = scrape_1688_data(keyword, max_items)
+            
+        if data:
+            st.success(f"✅ 成功抓取 {len(data)} 筆商品資料！")
+            
+            # 將資料轉換為 Pandas DataFrame 以利分析
+            df = pd.DataFrame(data)
+            
+            # 依價格由低到高排序
+            df_sorted = df.sort_values(by="價格 (RMB)", ascending=True).reset_index(drop=True)
+            
+            # 建立三個統計指標
+            col1, col2, col3 = st.columns(3)
+            with col1:
+                st.metric("最低價格", f"¥ {df_sorted['價格 (RMB)'].min():.2f}")
+            with col2:
+                st.metric("平均價格", f"¥ {df_sorted['價格 (RMB)'].mean():.2f}")
+            with col3:
+                st.metric("最高價格", f"¥ {df_sorted['價格 (RMB)'].max():.2f}")
+            
+            st.subheader("📊 比價結果清單 (由低至高)")
+            
+            # 使用 Streamlit 原生的 dataframe 顯示，可以自訂欄位格式
+            st.dataframe(
+                df_sorted,
+                column_config={
+                    "商品連結": st.column_config.LinkColumn("點擊前往"),
+                    "價格 (RMB)": st.column_config.NumberColumn("價格 (RMB)", format="¥ %.2f")
+                },
+                use_container_width=True,
+                hide_index=True
+            )
+            
+            # 提供 CSV 下載功能
+            csv = df_sorted.to_csv(index=False).encode('utf-8-sig')
+            st.download_button(
+                label="📥 下載比價結果 (CSV)",
+                data=csv,
+                file_name=f'1688_{keyword}_比價結果.csv',
+                mime='text/csv',
+            )
